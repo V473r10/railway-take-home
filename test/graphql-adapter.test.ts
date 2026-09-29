@@ -81,3 +81,111 @@ describe("GraphqlRailway.createContainer", () => {
     });
   });
 });
+
+describe("GraphqlRailway deployments and domains", () => {
+  it("creates the public domain on the image's port", async () => {
+    const { adapter, captured } = adapterReturning(() => json({ data: { serviceDomainCreate: { domain: "x.up.railway.app" } } }));
+
+    expect(await adapter.createDomain("svc-9")).toEqual({ kind: "ok", value: { domain: "x.up.railway.app" } });
+    const body = JSON.parse(String(captured[0]!.init.body)) as { query: string; variables: unknown };
+    expect(body.query).toContain("serviceDomainCreate(input:$input)");
+    expect(body.variables).toEqual({ input: { serviceId: "svc-9", environmentId: "env-1", targetPort: 80 } });
+  });
+
+  it("reads status together with deploymentStopped", async () => {
+    const { adapter, captured } = adapterReturning(() =>
+      json({ data: { deployment: { id: "dep-1", status: "SUCCESS", deploymentStopped: true } } }),
+    );
+
+    expect(await adapter.readDeployment("dep-1")).toEqual({
+      kind: "ok",
+      value: { deploymentId: "dep-1", status: "SUCCESS", stopped: true },
+    });
+    expect(String(captured[0]!.init.body)).toContain("deploymentStopped");
+  });
+
+  it("returns null while a service has no deployment yet", async () => {
+    const { adapter, captured } = adapterReturning(() => json({ data: { deployments: { edges: [] } } }));
+
+    expect(await adapter.latestDeployment("svc-9")).toEqual({ kind: "ok", value: null });
+    const body = JSON.parse(String(captured[0]!.init.body)) as { variables: unknown };
+    expect(body.variables).toEqual({ input: { projectId: "proj-1", environmentId: "env-1", serviceId: "svc-9" } });
+  });
+});
+
+/** A socket the test drives by hand: it records what the adapter sends and replays server frames. */
+class ScriptedSocket {
+  static last: ScriptedSocket | null = null;
+  readonly sent: { type: string; id?: string; payload?: Record<string, unknown> }[] = [];
+  closed = false;
+  onopen: (() => void) | null = null;
+  onmessage: ((event: { data: unknown }) => void) | null = null;
+  onerror: (() => void) | null = null;
+  onclose: ((event: { code: number }) => void) | null = null;
+
+  readonly url: string;
+  readonly protocol: string;
+
+  constructor(url: string, protocol: string) {
+    this.url = url;
+    this.protocol = protocol;
+    ScriptedSocket.last = this;
+  }
+  send(data: string): void {
+    this.sent.push(JSON.parse(data));
+  }
+  close(): void {
+    this.closed = true;
+  }
+  serverSends(frame: unknown): void {
+    this.onmessage?.({ data: JSON.stringify(frame) });
+  }
+}
+
+describe("GraphqlRailway.watchDeployment", () => {
+  const watch = () => {
+    const adapter = new GraphqlRailway({ token: "tok-secret", projectId: "p", environmentId: "e", WebSocket: ScriptedSocket });
+    const states: unknown[] = [];
+    const ends: string[] = [];
+    const stop = adapter.watchDeployment("dep-1", { onState: (s) => states.push(s), onEnd: (r) => ends.push(r) });
+    const socket = ScriptedSocket.last!;
+    socket.onopen?.();
+    return { socket, states, ends, stop };
+  };
+
+  it("authenticates in connection_init and subscribes only after the ack", () => {
+    const { socket } = watch();
+
+    expect(socket.url).toBe("wss://backboard.railway.com/graphql/v2");
+    expect(socket.protocol).toBe("graphql-transport-ws");
+    expect(socket.sent).toEqual([{ type: "connection_init", payload: { Authorization: "Bearer tok-secret" } }]);
+
+    socket.serverSends({ type: "connection_ack" });
+    expect(socket.sent[1]).toMatchObject({ id: "1", type: "subscribe", payload: { variables: { id: "dep-1" } } });
+    expect(String(socket.sent[1]!.payload!.query)).toContain("deploymentStopped");
+  });
+
+  it("delivers pushed states, answers pings and ends on an error frame", () => {
+    const { socket, states, ends } = watch();
+    socket.serverSends({ type: "connection_ack" });
+    socket.serverSends({ id: "1", type: "next", payload: { data: { deployment: { id: "dep-1", status: "SUCCESS", deploymentStopped: false } } } });
+    socket.serverSends({ type: "ping" });
+    socket.serverSends({ id: "1", type: "error", payload: [{ message: "Not Authorized" }] });
+
+    expect(states).toEqual([{ deploymentId: "dep-1", status: "SUCCESS", stopped: false }]);
+    expect(socket.sent.at(-1)).toEqual({ type: "pong" });
+    expect(ends).toHaveLength(1);
+    expect(ends[0]).toMatch(/Not Authorized/);
+    expect(socket.closed).toBe(true);
+  });
+
+  it("does not report an end the caller asked for", () => {
+    const { socket, ends, stop } = watch();
+    socket.serverSends({ type: "connection_ack" });
+    stop();
+    socket.onclose?.({ code: 1000 });
+
+    expect(socket.sent.at(-1)).toEqual({ id: "1", type: "complete" });
+    expect(ends).toEqual([]);
+  });
+});

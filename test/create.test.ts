@@ -29,7 +29,7 @@ describe("creating a container", () => {
     const body = (await (await create(h)).json()) as CreateBody;
     await h.settled();
 
-    expect(h.railway.calls).toEqual([
+    expect(h.railway.callsTo("createContainer")).toEqual([
       { method: "createContainer", input: { name: `rcc-${body.operation.id}`, image: "nginx:alpine" } },
     ]);
     expect(body.container.name).toBe(`rcc-${body.operation.id}`);
@@ -47,7 +47,7 @@ describe("creating a container", () => {
     const [a, b] = (await Promise.all([first.json(), second.json()])) as CreateBody[];
     expect(b!.operation.id).toBe(a!.operation.id);
     expect(await list(h)).toHaveLength(1);
-    expect(h.railway.calls).toHaveLength(1);
+    expect(h.railway.callsTo("createContainer")).toHaveLength(1);
   });
 
   it("turns concurrent requests with the same key into one operation", async () => {
@@ -60,7 +60,7 @@ describe("creating a container", () => {
     expect(ids.size).toBe(1);
     expect(responses.filter((r) => r.status === 202)).toHaveLength(1);
     expect(await list(h)).toHaveLength(1);
-    expect(h.railway.calls).toHaveLength(1);
+    expect(h.railway.callsTo("createContainer")).toHaveLength(1);
   });
 
   it("gives different keys different containers", async () => {
@@ -69,7 +69,7 @@ describe("creating a container", () => {
     await h.settled();
 
     expect(await list(h)).toHaveLength(2);
-    expect(h.railway.calls).toHaveLength(2);
+    expect(h.railway.callsTo("createContainer")).toHaveLength(2);
   });
 
   it.each([
@@ -84,7 +84,7 @@ describe("creating a container", () => {
     expect(((await res.json()) as { error: string }).error).toMatch(/Idempotency-Key/);
     await h.settled();
     expect(await list(h)).toHaveLength(0);
-    expect(h.railway.calls).toHaveLength(0);
+    expect(h.railway.callsTo("createContainer")).toHaveLength(0);
   });
 
   it("shows a container Railway refused as failed, with the message and trace id", async () => {

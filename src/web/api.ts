@@ -15,19 +15,44 @@ export type Container = {
   id: string;
   name: string;
   state: ContainerState;
+  url: string | null;
   createdAt: string;
   lastError: { message: string; traceId: string | null } | null;
 };
 
+export type LiveEvent =
+  | { type: "snapshot"; containers: Container[] }
+  | { type: "upsert"; container: Container }
+  | { type: "remove"; id: string };
+
+/**
+ * Follow the backend's SSE stream. EventSource reconnects on its own after a
+ * drop, and every (re)connect starts with a full snapshot, so nothing is missed.
+ */
+export function subscribeToContainers(handlers: {
+  onEvent: (event: LiveEvent) => void;
+  onConnection: (connected: boolean) => void;
+}): () => void {
+  const source = new EventSource("/api/events");
+  const handle = (message: MessageEvent<string>) => handlers.onEvent(JSON.parse(message.data) as LiveEvent);
+  for (const type of ["snapshot", "upsert", "remove"]) source.addEventListener(type, handle);
+  source.onopen = () => handlers.onConnection(true);
+  source.onerror = () => handlers.onConnection(false);
+  return () => source.close();
+}
+
+/** Apply one event to the list the UI shows, keeping creation order. */
+export function applyEvent(list: Container[] | null, event: LiveEvent): Container[] {
+  if (event.type === "snapshot") return event.containers;
+  const current = list ?? [];
+  if (event.type === "remove") return current.filter((c) => c.id !== event.id);
+  const exists = current.some((c) => c.id === event.container.id);
+  return exists ? current.map((c) => (c.id === event.container.id ? event.container : c)) : [...current, event.container];
+}
+
 async function readError(res: Response): Promise<string> {
   const body = (await res.json().catch(() => null)) as { error?: string } | null;
   return body?.error ?? `Request failed (HTTP ${res.status})`;
-}
-
-export async function listContainers(): Promise<Container[]> {
-  const res = await fetch("/api/containers");
-  if (!res.ok) throw new Error(await readError(res));
-  return ((await res.json()) as { containers: Container[] }).containers;
 }
 
 /** One key per click: resending the same click (a retry, a double submit) reuses it. */
