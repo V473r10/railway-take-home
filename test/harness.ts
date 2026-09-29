@@ -34,7 +34,7 @@ export async function startHarness(): Promise<Harness> {
 
   const url = new URL(ADMIN_URL);
   url.pathname = `/${name}`;
-  const db: Db = connect(url.toString());
+  const db: Db = connect(url.toString(), () => {});
   await migrate(db);
 
   const railway = new FakeRailway();

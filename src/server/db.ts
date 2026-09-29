@@ -4,8 +4,13 @@ import pg from "pg";
 
 export type Db = pg.Pool;
 
-export function connect(databaseUrl: string): Db {
-  return new pg.Pool({ connectionString: databaseUrl, max: 10 });
+export function connect(databaseUrl: string, log: (msg: string) => void = console.error): Db {
+  const pool = new pg.Pool({ connectionString: databaseUrl, max: 10 });
+  // An idle client can lose its connection (Postgres restart, a terminated backend).
+  // Without a listener that error is uncaught and takes the process down; the pool
+  // discards the client and opens a new one on the next query.
+  pool.on("error", (error) => log(`idle database connection lost: ${error.message}`));
+  return pool;
 }
 
 const MIGRATIONS_DIR = join(import.meta.dirname, "..", "..", "migrations");
