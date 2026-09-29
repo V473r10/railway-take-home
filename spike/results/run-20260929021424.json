@@ -1,0 +1,325 @@
+{
+  "runId": "20260929021424",
+  "tokenKind": "bearer",
+  "image": "nginx:alpine",
+  "workspaces": [
+    {
+      "id": "7c643d13-9049-4d3e-9484-8a2ed91bdeff",
+      "name": "Facundo Valerio's Projects",
+      "plan": "HOBBY",
+      "subscriptionPlanLimit": {
+        "includedUsageDollars": 5,
+        "projects": 2,
+        "project": {
+          "members": 3,
+          "services": 5
+        },
+        "volumes": {
+          "defaultSizeMB": 500,
+          "maxSizeMB": 500,
+          "maxPerProject": 3,
+          "maxBackupsCount": 0,
+          "maxBackupsUsagePercent": 0
+        },
+        "containers": {
+          "cpu": 2,
+          "cpuDescription": "2 vCPU",
+          "maxCpuDescription": "2 vCPU",
+          "memoryBytes": 1000000000,
+          "memoryDescription": "1 GB",
+          "maxMemoryDescription": "1 GB",
+          "diskBytes": 1000000000,
+          "diskDescription": "1 GB",
+          "pidLimit": 1000,
+          "volumeIopsLimit": 3000,
+          "volumeBpsLimit": 70000000,
+          "maxRestartPolicyRetries": 10
+        },
+        "builds": {
+          "concurrent": 3,
+          "timeout": {
+            "soft": 10,
+            "hard": 20
+          },
+          "maxImageSizeBytes": 4000000000
+        },
+        "deploys": {
+          "replicas": 2
+        },
+        "observability": {
+          "logRetentionDays": 7
+        },
+        "networking": {
+          "customDomains": 1,
+          "emailForwardingAliases": 1,
+          "serviceDomains": 2,
+          "tcpProxies": 3,
+          "edgeRules": 0,
+          "httpReqPerSecPerHost": 10000,
+          "httpReqPerSecPerHostBurst": 25000,
+          "httpResponseTimeoutSeconds": 900,
+          "tcpConnectionsPerSecPerHost": 500,
+          "tcpActiveConnectionsPerHost": 10000
+        },
+        "apiTokens": {
+          "pointsToConsume": 100
+        },
+        "buckets": {
+          "maxPerProject": 3,
+          "workspaceMaxStorageBytes": 50000000000
+        },
+        "sandboxes": {
+          "maxRunningPerEnvironment": 10,
+          "defaultIdleTimeoutMinutes": 5,
+          "maxIdleTimeoutMinutes": 5,
+          "allowNeverIdleTimeout": false
+        },
+        "auditLogs": {
+          "retentionDays": 2
+        },
+        "agent": {
+          "defaultUsageLimitCents": 150
+        },
+        "vms": {
+          "cpu": 2,
+          "memoryBytes": 2000000000,
+          "sandboxDefaultCpu": 2,
+          "sandboxDefaultMemoryBytes": 2000000000
+        },
+        "rateLimits": {
+          "projectCreate": {
+            "max": 1,
+            "windowSeconds": 30
+          },
+          "environmentCreate": {
+            "max": 1,
+            "windowSeconds": 30
+          },
+          "volumeCreate": {
+            "max": 1,
+            "windowSeconds": 30
+          }
+        }
+      },
+      "apiTokenRateLimit": null
+    }
+  ],
+  "projectId": "d44ce068-380c-468e-ab0f-45acaba54c36",
+  "environmentId": "2be6e966-b88c-4c78-a983-efb7702deac5",
+  "tokenCanCreateService": true,
+  "serviceCreateAutoDeploys": true,
+  "domain": "spike-20260929021424-production.up.railway.app",
+  "up": {
+    "status": "SUCCESS",
+    "via": "poll"
+  },
+  "subscriptionWorks": false,
+  "httpCheck": {
+    "status": 200,
+    "attempts": 1
+  },
+  "afterStop": {
+    "status": "SUCCESS",
+    "deploymentStopped": true
+  },
+  "redeployCreatesNewDeployment": true,
+  "interruptedBy": "SIGINT",
+  "restart": {
+    "status": "REMOVED",
+    "via": "ws"
+  },
+  "afterDelete": {
+    "deletedAt": "2026-09-29T02:18:03.593Z",
+    "found": true
+  },
+  "totals": {
+    "requests": 16,
+    "remainingAtEnd": 958
+  },
+  "wsCost": [
+    {
+      "phase": "restart",
+      "pointsUsed": 1
+    }
+  ],
+  "steps": [
+    {
+      "step": "identity:me",
+      "ms": 276,
+      "requests": 1,
+      "ok": true,
+      "note": "fails with a workspace token (account-scoped query)"
+    },
+    {
+      "step": "project:environments",
+      "ms": 204,
+      "requests": 1,
+      "ok": true
+    },
+    {
+      "step": "serviceCreate",
+      "ms": 404,
+      "requests": 1,
+      "ok": true
+    },
+    {
+      "step": "check:autoDeploy",
+      "ms": 233,
+      "requests": 1,
+      "ok": true
+    },
+    {
+      "step": "serviceDomainCreate",
+      "ms": 1199,
+      "requests": 1,
+      "ok": true
+    },
+    {
+      "step": "watch:up",
+      "ms": 180706,
+      "requests": 3,
+      "ok": true
+    },
+    {
+      "step": "http:get",
+      "ms": 686,
+      "requests": 0,
+      "ok": true,
+      "note": "not an API request"
+    },
+    {
+      "step": "deploymentStop",
+      "ms": 341,
+      "requests": 1,
+      "ok": true
+    },
+    {
+      "step": "watch:stop",
+      "ms": 3208,
+      "requests": 1,
+      "ok": true
+    },
+    {
+      "step": "serviceInstanceRedeploy",
+      "ms": 522,
+      "requests": 1,
+      "ok": true
+    },
+    {
+      "step": "check:redeployId",
+      "ms": 278,
+      "requests": 1,
+      "ok": true
+    },
+    {
+      "step": "watch:restart",
+      "ms": 17488,
+      "requests": 3,
+      "ok": true
+    },
+    {
+      "step": "serviceDelete",
+      "ms": 3591,
+      "requests": 2,
+      "ok": true
+    },
+    {
+      "step": "verify:deleted",
+      "ms": 201,
+      "requests": 1,
+      "ok": true
+    }
+  ],
+  "statusTrail": [
+    {
+      "phase": "up",
+      "status": "SUCCESS",
+      "at": "2026-09-29T02:17:35.487Z",
+      "via": "poll"
+    },
+    {
+      "phase": "stop",
+      "status": "SUCCESS",
+      "at": "2026-09-29T02:17:39.722Z",
+      "via": "poll"
+    },
+    {
+      "phase": "restart",
+      "status": "REMOVING",
+      "at": "2026-09-29T02:18:01.381Z",
+      "via": "ws"
+    },
+    {
+      "phase": "restart",
+      "status": "REMOVED",
+      "at": "2026-09-29T02:18:02.789Z",
+      "via": "ws"
+    }
+  ],
+  "remainingSamples": [
+    {
+      "label": "gql",
+      "remaining": 973
+    },
+    {
+      "label": "gql",
+      "remaining": 972
+    },
+    {
+      "label": "gql",
+      "remaining": 971
+    },
+    {
+      "label": "latestDeployment",
+      "remaining": 970
+    },
+    {
+      "label": "gql",
+      "remaining": 969
+    },
+    {
+      "label": "before-ws:up",
+      "remaining": 968
+    },
+    {
+      "label": "after-ws:up",
+      "remaining": 967
+    },
+    {
+      "label": "poll:up",
+      "remaining": 966
+    },
+    {
+      "label": "gql",
+      "remaining": 965
+    },
+    {
+      "label": "stop:read",
+      "remaining": 964
+    },
+    {
+      "label": "gql",
+      "remaining": 963
+    },
+    {
+      "label": "latestDeployment",
+      "remaining": 962
+    },
+    {
+      "label": "before-ws:restart",
+      "remaining": 961
+    },
+    {
+      "label": "after-ws:restart",
+      "remaining": 959
+    },
+    {
+      "label": "gql",
+      "remaining": 960
+    },
+    {
+      "label": "verify:deleted",
+      "remaining": 958
+    }
+  ]
+}

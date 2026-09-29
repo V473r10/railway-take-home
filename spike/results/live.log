@@ -1,0 +1,28 @@
+02:14:24 ✓ identity:me (276 ms, 1 req, remaining 973)
+02:14:24 ✓ project:environments (204 ms, 1 req, remaining 972)
+02:14:25 ✓ serviceCreate (404 ms, 1 req, remaining 971)
+02:14:33 ✓ check:autoDeploy (233 ms, 1 req, remaining 970)
+02:14:33   deployment 90090ea5-6c74-49c4-a136-6590be500dce (auto-deployed on create)
+02:14:34 ✓ serviceDomainCreate (1199 ms, 1 req, remaining 969)
+02:14:34   watching deployment 90090ea5-6c74-49c4-a136-6590be500dce (up) via ws, up to 3 min
+02:14:35   [ws frame] connection_ack
+02:17:35   subscription gave nothing, falling back to polling
+02:17:35   [poll] SUCCESS
+02:17:35 ✓ watch:up (180706 ms, 3 req, remaining 966)
+02:17:36 ✓ http:get (686 ms, 0 req, remaining 966)
+02:17:36 ✓ deploymentStop (341 ms, 1 req, remaining 965)
+02:17:39 ✓ watch:stop (3208 ms, 1 req, remaining 964)
+02:17:40 ✓ serviceInstanceRedeploy (522 ms, 1 req, remaining 963)
+02:17:45 ✓ check:redeployId (278 ms, 1 req, remaining 962)
+02:17:45   watching deployment 647171ad-3710-4895-883b-b38d14562be5 (restart) via ws, up to 3 min
+02:17:46   [ws frame] connection_ack
+02:18:00 
+SIGINT received: cleaning up before exit
+02:18:01   [ws] REMOVING
+02:18:02   [ws] REMOVED
+02:18:03 ✓ watch:restart (17488 ms, 3 req, remaining 959)
+02:18:03 ✓ serviceDelete (3591 ms, 2 req, remaining 960)
+02:18:03 ✓ verify:deleted (201 ms, 1 req, remaining 958)
+02:18:03 
+requests: 16, remaining: 958
+report: /home/v473r10/.kiro/crew/workspace/job-hunt/railway/spike/results/run-20260929021424.json

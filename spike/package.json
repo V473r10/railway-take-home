@@ -1,0 +1,7 @@
+{
+  "name": "railway-spike",
+  "private": true,
+  "type": "module",
+  "engines": { "node": ">=23.6" },
+  "scripts": { "spike": "node spike.ts" }
+}
