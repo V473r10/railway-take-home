@@ -87,6 +87,11 @@ th {
   color: var(--danger);
 }
 
+.notice {
+  padding: 0.5rem 0.75rem;
+  border-left: 3px solid currentColor;
+}
+
 .visually-hidden {
   position: absolute;
   width: 1px;
