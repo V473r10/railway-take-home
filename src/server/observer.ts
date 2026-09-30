@@ -32,12 +32,15 @@ export class Observer {
     this.#deps = deps;
   }
 
-  /** Watch every container that has a service. Called once at startup. */
-  async start(): Promise<void> {
+  /**
+   * Watch every container that has a service. Called once at startup. `except` are
+   * containers a resumed operation starts watching itself, once it knows what to watch.
+   */
+  async start(except: ReadonlySet<string> = new Set()): Promise<void> {
     const { rows } = await this.#deps.db.query<{ id: string }>(
       "SELECT id FROM containers WHERE service_id IS NOT NULL AND destroyed_at IS NULL",
     );
-    for (const row of rows) this.track(row.id);
+    for (const row of rows) if (!except.has(row.id)) this.track(row.id);
   }
 
   /** Start watching a container, or restart the watch after its current deployment changed. */

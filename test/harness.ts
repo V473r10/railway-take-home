@@ -7,7 +7,8 @@ import { createApp } from "../src/server/app.ts";
 import { ManualClock } from "../src/server/clock.ts";
 import { ContainerControl } from "../src/server/containers.ts";
 import { connect, type Db, migrate } from "../src/server/db.ts";
-import { FakeRailway } from "../src/server/railway/fake.ts";
+import type { CreateContainerInput, DeploymentWatch, RailwayAdapter } from "../src/server/railway/adapter.ts";
+import { type FakeCall, type FakeMutation, FakeRailway } from "../src/server/railway/fake.ts";
 
 const ADMIN_URL = process.env.TEST_DATABASE_URL ?? "postgres://postgres@127.0.0.1:54329/postgres";
 
@@ -22,6 +23,12 @@ export type Harness = {
   settled: () => Promise<void>;
   /** Open the SSE stream, as a browser tab would. */
   events: () => Promise<EventStream>;
+  /** Kill the backend process on its next call to `method`, before or after Railway acts on it. */
+  dieOn: (method: FakeMutation, when: DeathPoint) => void;
+  /** Whether the current backend process has died. */
+  readonly dead: boolean;
+  /** Start a new backend process on the same database and Railway; the old one, if alive, is killed. */
+  restart: () => Promise<void>;
   close: () => Promise<void>;
 };
 
@@ -38,38 +45,145 @@ export async function startHarness(): Promise<Harness> {
 
   const url = new URL(ADMIN_URL);
   url.pathname = `/${name}`;
-  const db: Db = connect(url.toString(), () => {});
-  await migrate(db);
-
   const railway = new FakeRailway();
   const clock = new ManualClock();
   const log = () => {};
-  const control = new ContainerControl({ db, railway, clock, log });
-  await control.start();
-  const app = createApp({ control, log });
+  const pools: Db[] = [];
+
+  // One backend process: its own pool and its own line to Railway, over the shared database and fake.
+  const boot = async () => {
+    const db: Db = connect(url.toString(), () => {});
+    pools.push(db);
+    await migrate(db);
+    const line = new ProcessRailway(railway);
+    const control = new ContainerControl({ db, railway: line, clock, log });
+    await control.start();
+    return { db, line, control, app: createApp({ control, log }) };
+  };
+  let current = await boot();
   const streams = new Set<EventStream>();
 
   return {
     railway,
     clock,
-    db,
-    request: async (path, init) => app.request(path, init),
-    settled: () => control.settled(),
+    get db() {
+      return current.db;
+    },
+    request: async (path, init) => current.app.request(path, init),
+    settled: () => current.control.settled(),
     events: async () => {
-      const stream = await openEventStream(await app.request("/api/events"));
+      const stream = await openEventStream(await current.app.request("/api/events"));
       streams.add(stream);
       return stream;
     },
+    dieOn: (method, when) => current.line.dieOn(method, when),
+    get dead() {
+      return current.line.dead;
+    },
+    restart: async () => {
+      for (const stream of streams) await stream.close();
+      current.line.kill();
+      current = await boot();
+    },
     close: async () => {
       for (const stream of streams) await stream.close();
-      await control.close();
-      await db.end();
+      await current.control.close();
+      // A killed process's pool has nothing in flight: its drives wait on Railway forever.
+      for (const pool of pools) await pool.end();
       const cleanup = new pg.Client({ connectionString: ADMIN_URL });
       await cleanup.connect();
       await cleanup.query(`DROP DATABASE IF EXISTS ${name} WITH (FORCE)`);
       await cleanup.end();
     },
   };
+}
+
+/** When a process dies on a call: before the call reaches Railway, or after Railway acted on it. */
+export type DeathPoint = "before_acting" | "after_acting";
+
+/**
+ * One process's line to Railway. Once the process is killed it gets no answer to
+ * anything, in flight or new, and hears nothing from its subscriptions: whatever it
+ * was doing stops there, exactly as far as Railway got, as a killed process would.
+ */
+class ProcessRailway implements RailwayAdapter {
+  readonly #railway: FakeRailway;
+  readonly #subscriptions = new Set<() => void>();
+  #death: { method: FakeMutation; when: DeathPoint } | null = null;
+  #dead = false;
+
+  constructor(railway: FakeRailway) {
+    this.#railway = railway;
+  }
+
+  get dead(): boolean {
+    return this.#dead;
+  }
+
+  dieOn(method: FakeMutation, when: DeathPoint): void {
+    this.#death = { method, when };
+  }
+
+  kill(): void {
+    this.#dead = true;
+    for (const unsubscribe of this.#subscriptions) unsubscribe();
+    this.#subscriptions.clear();
+  }
+
+  async #forward<T>(method: FakeCall["method"], call: () => Promise<T>): Promise<T> {
+    if (!this.#dead && this.#death?.method === method) {
+      const { when } = this.#death;
+      this.#death = null;
+      if (when === "after_acting") await call();
+      this.kill();
+    }
+    if (this.#dead) return new Promise<T>(() => {});
+    return call();
+  }
+
+  createContainer(input: CreateContainerInput) {
+    return this.#forward("createContainer", () => this.#railway.createContainer(input));
+  }
+  findService(name: string) {
+    return this.#forward("findService", () => this.#railway.findService(name));
+  }
+  createDomain(serviceId: string) {
+    return this.#forward("createDomain", () => this.#railway.createDomain(serviceId));
+  }
+  serviceDomain(serviceId: string) {
+    return this.#forward("serviceDomain", () => this.#railway.serviceDomain(serviceId));
+  }
+  latestDeployment(serviceId: string) {
+    return this.#forward("latestDeployment", () => this.#railway.latestDeployment(serviceId));
+  }
+  readDeployment(deploymentId: string) {
+    return this.#forward("readDeployment", () => this.#railway.readDeployment(deploymentId));
+  }
+  stopDeployment(deploymentId: string) {
+    return this.#forward("stopDeployment", () => this.#railway.stopDeployment(deploymentId));
+  }
+  redeployService(serviceId: string) {
+    return this.#forward("redeployService", () => this.#railway.redeployService(serviceId));
+  }
+  deleteService(serviceId: string) {
+    return this.#forward("deleteService", () => this.#railway.deleteService(serviceId));
+  }
+  watchDeployment(deploymentId: string, watch: DeploymentWatch): () => void {
+    if (this.#dead) return () => {};
+    const unsubscribe = this.#railway.watchDeployment(deploymentId, {
+      onState: (state) => {
+        if (!this.#dead) watch.onState(state);
+      },
+      onEnd: (reason) => {
+        if (!this.#dead) watch.onEnd(reason);
+      },
+    });
+    this.#subscriptions.add(unsubscribe);
+    return () => {
+      this.#subscriptions.delete(unsubscribe);
+      unsubscribe();
+    };
+  }
 }
 
 export type ContainerBody = {
