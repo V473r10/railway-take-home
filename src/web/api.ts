@@ -26,8 +26,12 @@ export type Container = {
   actions: Record<ContainerAction, Availability>;
 };
 
+/** Set while the app cannot confirm who its Railway token belongs to; every operation is refused (ADR 0003). */
+export type ReadOnlyMode = { reason: string };
+
 export type LiveEvent =
-  | { type: "snapshot"; containers: Container[] }
+  /** `readOnly` is fixed until the server restarts, so the snapshot is the only event that carries it. */
+  | { type: "snapshot"; containers: Container[]; readOnly: ReadOnlyMode | null }
   | { type: "upsert"; container: Container }
   | { type: "remove"; id: string };
 

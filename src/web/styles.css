@@ -117,3 +117,11 @@ button.danger {
   border-color: var(--danger);
   color: var(--danger);
 }
+
+.banner-read-only {
+  padding: 0.75rem 1rem;
+  border: 1px solid var(--danger);
+  border-radius: 0.4rem;
+  background: color-mix(in srgb, var(--danger) 12%, transparent);
+  color: var(--danger);
+}

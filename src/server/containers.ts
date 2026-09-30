@@ -61,6 +61,15 @@ export class ContainerNotFound extends Error {}
 /** The action cannot be requested in the container's current state; the message is shown to the user. */
 export class ActionRefused extends Error {}
 
+/** The app is in read-only mode: every operation is refused. The message is shown to the user. */
+export class ReadOnlyRefused extends Error {}
+
+/**
+ * Read-only mode (ADR 0003): the token's identity could not be confirmed at startup.
+ * Fixed until the app restarts; `reason` is shown to the user.
+ */
+export type ReadOnlyMode = { reason: string };
+
 const TRANSITIONAL: Record<OperationKind, ContainerState> = {
   create: "creating",
   start: "starting",
@@ -123,7 +132,9 @@ export function availability(row: ContainerRow, action: ContainerAction): Availa
   return { allowed: true };
 }
 
-function toView(row: ContainerRow): ContainerView {
+function toView(row: ContainerRow, readOnly: ReadOnlyMode | null): ContainerView {
+  const actionAvailability = (action: ContainerAction): Availability =>
+    readOnly ? { allowed: false, reason: readOnly.reason } : availability(row, action);
   return {
     id: row.id,
     name: row.name,
@@ -134,7 +145,7 @@ function toView(row: ContainerRow): ContainerView {
     activeOperation:
       isActive(row.op_status) && row.op_id && row.op_kind && row.op_status ? { id: row.op_id, kind: row.op_kind, status: row.op_status } : null,
     lastError: row.op_status === "failed" && row.op_error ? { message: row.op_error, traceId: row.op_trace_id } : null,
-    actions: { stop: availability(row, "stop"), start: availability(row, "start"), destroy: availability(row, "destroy") },
+    actions: { stop: actionAvailability("stop"), start: actionAvailability("start"), destroy: actionAvailability("destroy") },
   };
 }
 
@@ -196,6 +207,7 @@ export class ContainerControl {
   readonly #closing = new AbortController();
   /** Per container, the drive in flight for it, so a Destroy can interrupt it and wait for it. */
   readonly #drives = new Map<string, { done: Promise<void>; abort: AbortController }>();
+  #readOnly: ReadOnlyMode | null = null;
 
   constructor(deps: ContainerControlDeps) {
     this.#deps = deps;
@@ -209,29 +221,51 @@ export class ContainerControl {
   }
 
   /**
-   * Reconcile, then observe. An operation still active in the database was left by a
-   * process that stopped mid-way, so Railway may or may not have acted on its last call.
-   * Each one is resumed: it looks at Railway first and then does only what is still
-   * missing, so nothing is duplicated (ADR 0004). Every resumed drive is claimed here,
-   * before the app accepts requests, and the one-active-operation rule keeps a new
-   * request from interleaving with it; Destroy can still interrupt it, as always.
+   * Confirm who the Railway token belongs to, reconcile, then observe.
+   *
+   * An unconfirmed token puts the app in read-only mode instead of failing the
+   * start (ADR 0003). Observing only reads, so it runs either way; reconciling
+   * writes, so in read-only mode it waits for a restart with a good token.
+   *
+   * An operation still active in the database was left by a process that stopped
+   * mid-way, so Railway may or may not have acted on its last call. Each one is
+   * resumed: it looks at Railway first and then does only what is still missing, so
+   * nothing is duplicated (ADR 0004). Every resumed drive is claimed here, before the
+   * app accepts requests, and the one-active-operation rule keeps a new request from
+   * interleaving with it; Destroy can still interrupt it, as always.
    */
   async start(): Promise<void> {
+    const log = this.#deps.log ?? console.error;
+    const identity = await this.#deps.railway.verifyIdentity();
+    if (identity.kind !== "ok") {
+      this.#readOnly = { reason: readOnlyReason(identity) };
+      log(`read-only mode: ${this.#readOnly.reason}`);
+    }
     const { rows } = await this.#deps.db.query<{ id: string; kind: OperationKind; container_id: string }>(
       "SELECT id, kind, container_id FROM operations WHERE status IN ('pending', 'in_progress') ORDER BY seq",
     );
+    if (this.#readOnly) {
+      if (rows.length > 0) log(`not reconciling ${rows.length} operation(s) left active by a previous process: read-only mode`);
+      await this.#observer.start();
+      return;
+    }
     // A Destroy supersedes whatever else its container was doing; only the Destroy is resumed.
     const destroying = new Set(rows.filter((r) => r.kind === "destroy").map((r) => r.container_id));
     const resumed = rows.filter((r) => r.kind === "destroy" || !destroying.has(r.container_id));
     // A resumed Create, Start or Destroy decides itself when its container is watched.
     await this.#observer.start(new Set(resumed.filter((r) => r.kind !== "stop").map((r) => r.container_id)));
-    if (resumed.length > 0) (this.#deps.log ?? console.error)(`reconciling ${resumed.length} operation(s) left active by a previous process`);
+    if (resumed.length > 0) log(`reconciling ${resumed.length} operation(s) left active by a previous process`);
     for (const op of resumed) {
       if (op.kind === "destroy") this.#track(this.#driveDestroy(op.id, op.container_id, { resume: true }));
       else if (op.kind === "create") this.#trackDrive(op.container_id, (signal) => this.#driveCreate(op.id, signal, { resume: true }));
       else if (op.kind === "stop") this.#trackDrive(op.container_id, (signal) => this.#driveStop(op.id, signal, { resume: true }));
       else this.#trackDrive(op.container_id, (signal) => this.#driveStart(op.id, signal, { resume: true }));
     }
+  }
+
+  /** Null unless the app is in read-only mode. Checked once at startup and fixed until restart. */
+  get readOnly(): ReadOnlyMode | null {
+    return this.#readOnly;
   }
 
   /** Let in-flight operations finish, then stop observing Railway. */
@@ -248,6 +282,7 @@ export class ContainerControl {
   }
 
   async requestCreate(idempotencyKey: string): Promise<RequestResult> {
+    this.#refuseIfReadOnly();
     const { db, clock } = this.#deps;
     const operationId = randomUUID();
     const containerId = randomUUID();
@@ -282,6 +317,7 @@ export class ContainerControl {
    * concurrent request for the same container waits here and then sees this one as active.
    */
   async requestAction(containerId: string, action: ContainerAction, idempotencyKey: string): Promise<RequestResult> {
+    this.#refuseIfReadOnly();
     const { db, clock } = this.#deps;
     const operationId = randomUUID();
     const now = clock.now();
@@ -326,13 +362,18 @@ export class ContainerControl {
 
   async listContainers(): Promise<ContainerView[]> {
     const { rows } = await this.#deps.db.query<ContainerRow>(`${CONTAINERS_SQL} ORDER BY c.created_at, c.id`);
-    return rows.map(toView);
+    return rows.map((row) => toView(row, this.#readOnly));
   }
 
   /** One container as the user sees it, or null once it is gone. */
   async getContainer(containerId: string): Promise<ContainerView | null> {
     const { rows } = await this.#deps.db.query<ContainerRow>(`${CONTAINERS_SQL} AND c.id = $1`, [containerId]);
-    return rows[0] ? toView(rows[0]) : null;
+    return rows[0] ? toView(rows[0], this.#readOnly) : null;
+  }
+
+  /** Before anything is written: in read-only mode no operation is recorded, let alone sent to Railway. */
+  #refuseIfReadOnly(): void {
+    if (this.#readOnly) throw new ReadOnlyRefused(this.#readOnly.reason);
   }
 
   /** Resolves once every operation started so far has stopped making progress. Used by tests and shutdown. */
@@ -760,4 +801,15 @@ export class ContainerControl {
       if (this.#drives.get(containerId) === entry) this.#drives.delete(containerId);
     });
   }
+}
+
+/** Why the token is unconfirmed, as the read-only banner and every refusal say it. */
+function readOnlyReason(outcome: Exclude<Outcome<unknown>, { kind: "ok" }>): string {
+  const detail =
+    outcome.kind === "rejected"
+      ? `Railway answered: ${outcome.message}`
+      : outcome.kind === "rate_limited"
+        ? "Railway rate-limited the check"
+        : `Railway did not answer: ${outcome.reason}`;
+  return `Read-only mode: the app could not confirm who its Railway token belongs to (${detail}). Every operation is refused until the token is fixed and the app is restarted.`;
 }

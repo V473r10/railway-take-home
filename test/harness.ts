@@ -27,8 +27,12 @@ export type Harness = {
   dieOn: (method: FakeMutation, when: DeathPoint) => void;
   /** Whether the current backend process has died. */
   readonly dead: boolean;
-  /** Start a new backend process on the same database and Railway; the old one, if alive, is killed. */
-  restart: () => Promise<void>;
+  /**
+   * Start a new backend process on the same database and Railway; the old one, if
+   * alive, is killed. `beforeBoot` runs in between, to set up what Railway will
+   * answer at startup. Open event streams are closed.
+   */
+  restart: (beforeBoot?: (railway: FakeRailway) => void) => Promise<void>;
   close: () => Promise<void>;
 };
 
@@ -58,10 +62,17 @@ export async function startHarness(): Promise<Harness> {
     const line = new ProcessRailway(railway);
     const control = new ContainerControl({ db, railway: line, clock, log });
     await control.start();
+    // The identity check at boot is not something a test's own requests caused.
+    const identity = railway.calls.findIndex((c) => c.method === "verifyIdentity");
+    if (identity !== -1) railway.calls.splice(identity, 1);
     return { db, line, control, app: createApp({ control, log }) };
   };
   let current = await boot();
   const streams = new Set<EventStream>();
+  const closeStreams = async () => {
+    for (const stream of streams) await stream.close();
+    streams.clear();
+  };
 
   return {
     railway,
@@ -80,13 +91,14 @@ export async function startHarness(): Promise<Harness> {
     get dead() {
       return current.line.dead;
     },
-    restart: async () => {
-      for (const stream of streams) await stream.close();
+    restart: async (beforeBoot) => {
+      await closeStreams();
       current.line.kill();
+      beforeBoot?.(railway);
       current = await boot();
     },
     close: async () => {
-      for (const stream of streams) await stream.close();
+      await closeStreams();
       await current.control.close();
       // A killed process's pool has nothing in flight: its drives wait on Railway forever.
       for (const pool of pools) await pool.end();
@@ -141,6 +153,9 @@ class ProcessRailway implements RailwayAdapter {
     return call();
   }
 
+  verifyIdentity() {
+    return this.#forward("verifyIdentity", () => this.#railway.verifyIdentity());
+  }
   createContainer(input: CreateContainerInput) {
     return this.#forward("createContainer", () => this.#railway.createContainer(input));
   }
@@ -212,7 +227,7 @@ export async function list(h: Harness): Promise<ContainerBody[]> {
 }
 
 export type LiveEvent =
-  | { type: "snapshot"; containers: ContainerBody[] }
+  | { type: "snapshot"; containers: ContainerBody[]; readOnly: { reason: string } | null }
   | { type: "upsert"; container: ContainerBody }
   | { type: "remove"; id: string };
 

@@ -4,7 +4,7 @@ import { join, relative } from "node:path";
 import { serveStatic } from "@hono/node-server/serve-static";
 import { Hono } from "hono";
 import { streamSSE } from "hono/streaming";
-import { ActionRefused, ContainerNotFound, type ContainerControl, IdempotencyKeyReused } from "./containers.ts";
+import { ActionRefused, ContainerNotFound, type ContainerControl, IdempotencyKeyReused, ReadOnlyRefused } from "./containers.ts";
 import { LiveFeed } from "./live.ts";
 
 // Printable ASCII, the shape of a UUID or similar client-generated token.
@@ -23,7 +23,7 @@ export function createApp({ control, webRoot, log }: AppDeps): Hono {
 
   app.get("/api/health", (c) => c.json({ ok: true }));
 
-  app.get("/api/containers", async (c) => c.json({ containers: await control.listContainers() }));
+  app.get("/api/containers", async (c) => c.json({ containers: await control.listContainers(), readOnly: control.readOnly }));
 
   // The browser's only view of state: the full list on connect, then each change (ADR 0001).
   app.get("/api/events", (c) =>
@@ -53,6 +53,7 @@ export function createApp({ control, webRoot, log }: AppDeps): Hono {
       c.header("Idempotent-Replayed", String(result.replayed));
       return c.json({ operation: result.operation, container: result.container }, result.replayed ? 200 : 202);
     } catch (error) {
+      if (error instanceof ReadOnlyRefused) return c.json({ error: error.message }, 503);
       if (error instanceof IdempotencyKeyReused) return c.json({ error: "This Idempotency-Key was already used for a different action." }, 422);
       throw error;
     }
@@ -72,6 +73,8 @@ export function createApp({ control, webRoot, log }: AppDeps): Hono {
       c.header("Idempotent-Replayed", String(result.replayed));
       return c.json({ operation: result.operation, container: result.container }, result.replayed ? 200 : 202);
     } catch (error) {
+      // 503, not 409: the refusal is about the app, not the container; no other action or wait helps until a restart.
+      if (error instanceof ReadOnlyRefused) return c.json({ error: error.message }, 503);
       if (error instanceof ContainerNotFound) return c.json({ error: "No such container." }, 404);
       if (error instanceof ActionRefused) return c.json({ error: error.message }, 409);
       if (error instanceof IdempotencyKeyReused) return c.json({ error: "This Idempotency-Key was already used for a different action." }, 422);
