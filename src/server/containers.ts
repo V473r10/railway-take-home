@@ -673,7 +673,11 @@ export class ContainerControl {
     });
   }
 
-  /** A Stop completes when the observer sees the deployment stopped. */
+  /**
+   * A Stop completes when the deployment is seen stopped. Railway's subscription does
+   * not push that (the status stays SUCCESS), so after asking, the Stop reads the
+   * deployment itself with backoff until it is stopped.
+   */
   async #driveStop(operationId: string, signal: AbortSignal, { resume = false } = {}): Promise<void> {
     const { railway } = this.#deps;
     const op = await this.#begin(operationId, { resume });
@@ -683,14 +687,28 @@ export class ContainerControl {
     if (op.resumed) {
       const seen = await this.#call(operationId, () => railway.readDeployment(deploymentId), { signal });
       if (seen.kind !== "ok") return this.#unsuccessful(operationId, op.container_id, seen, "reading the deployment");
-      // The previous process's stop did act: the observer completes the Stop from what it reads.
-      if (seen.value.stopped) return;
+      // The previous process's stop did act: storing what was read completes the Stop.
+      if (seen.value.stopped) return this.#confirmStopped(operationId, op.container_id, deploymentId);
     }
     const stopped = await this.#call(operationId, () => railway.stopDeployment(deploymentId), {
       signal,
       lookup: async () => lookupFrom(await railway.readDeployment(deploymentId), (state) => (state.stopped ? done(undefined) : RETRY)),
     });
     if (stopped.kind !== "ok") return this.#unsuccessful(operationId, op.container_id, stopped, "stopping the deployment");
+    this.#confirmStopped(operationId, op.container_id, deploymentId);
+  }
+
+  /**
+   * Hand the Stop to the observer, which reads the deployment with backoff until
+   * Railway reports it stopped (or no longer SUCCESS) and stores each read, so the
+   * usual observation path settles the Stop. It gives up once the Stop is no longer
+   * in progress, e.g. a Destroy superseded it.
+   */
+  #confirmStopped(operationId: string, containerId: string, deploymentId: string): void {
+    this.#observer.confirmStopped(containerId, deploymentId, async () => {
+      const { rows } = await this.#deps.db.query<{ status: OperationStatus }>("SELECT status FROM operations WHERE id = $1", [operationId]);
+      return rows[0]?.status === "in_progress";
+    });
   }
 
   /**

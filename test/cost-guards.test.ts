@@ -1,7 +1,7 @@
 import { randomUUID } from "node:crypto";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import { CONTAINER_LIFETIME_MS, CONTAINER_LIMIT, CONTAINER_LIMIT_MESSAGE, LIFETIME_SWEEP_MS } from "../src/server/containers.ts";
-import { action, type CreateBody, create, eventually, type Harness, list, startHarness } from "./harness.ts";
+import { action, type CreateBody, create, eventually, type Harness, list, startHarness, railwayStops } from "./harness.ts";
 
 let h: Harness;
 beforeEach(async () => {
@@ -24,7 +24,7 @@ async function container(stopped = false): Promise<string> {
   if (stopped) {
     await action(h, body.container.id, "stop");
     await h.settled();
-    h.railway.setDeployment(serviceId, "SUCCESS", true);
+    await railwayStops(h, serviceId);
     await eventually(async () => (await list(h)).find((c) => c.id === body.container.id)?.state === "stopped");
   }
   return body.container.id;

@@ -1,5 +1,5 @@
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
-import { type CreateBody, action, create, type DeathPoint, eventually, type Harness, list, startHarness } from "./harness.ts";
+import { type CreateBody, action, create, type DeathPoint, eventually, type Harness, list, startHarness, railwayStops } from "./harness.ts";
 
 // The backend is killed in the middle of an operation and a second instance boots
 // on the same database and Railway. It must finish the operation from where Railway
@@ -35,7 +35,7 @@ async function stopped(): Promise<{ id: string; serviceId: string }> {
   const c = await running();
   await action(h, c.id, "stop");
   await h.settled();
-  h.railway.setDeployment(c.serviceId, "SUCCESS", true);
+  await railwayStops(h, c.serviceId);
   await eventually(async () => (await stateOf(c.id)) === "stopped");
   return c;
 }
@@ -120,7 +120,7 @@ describe("a Stop interrupted by a restart", () => {
     expect(h.railway.callsTo("stopDeployment")).toHaveLength(1);
     expect(await stateOf(id)).toBe("stopping");
 
-    h.railway.setDeployment(serviceId, "SUCCESS", true);
+    await railwayStops(h, serviceId);
     await eventually(async () => (await stateOf(id)) === "stopped");
     expect(await operationStatus(operationId)).toBe("succeeded");
   });
