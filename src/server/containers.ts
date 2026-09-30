@@ -43,6 +43,8 @@ export type ContainerView = {
   /** The public URL; only reachable while the container is running. */
   url: string | null;
   createdAt: string;
+  /** When the lifetime sweep destroys it. */
+  expiresAt: string;
   activeOperation: OperationView | null;
   lastError: { message: string; traceId: string | null } | null;
   /** Computed by the same rule that refuses a request, so the UI and the API cannot disagree. */
@@ -63,6 +65,19 @@ export class ActionRefused extends Error {}
 
 /** The app is in read-only mode: every operation is refused. The message is shown to the user. */
 export class ReadOnlyRefused extends Error {}
+
+/** Creating another container would exceed the container limit. The message is shown to the user. */
+export class ContainerLimitReached extends Error {}
+
+/** At most this many containers exist at once, stopped ones included: each takes a service slot in the sandbox. */
+export const CONTAINER_LIMIT = 5;
+/** Every container is destroyed this long after it was created, whatever its state. */
+export const CONTAINER_LIFETIME_MS = 30 * 60 * 1000;
+/** How often the lifetime sweep runs, besides once at startup. */
+export const LIFETIME_SWEEP_MS = 60 * 1000;
+export const CONTAINER_LIMIT_MESSAGE = `The limit of ${CONTAINER_LIMIT} containers is reached (stopped ones count). Destroy one to create another.`;
+// Serializes every create's count-then-insert, so concurrent creates cannot pass the limit together.
+const CREATE_LOCK = 7_202_605;
 
 /**
  * Read-only mode (ADR 0003): the token's identity could not be confirmed at startup.
@@ -142,6 +157,7 @@ function toView(row: ContainerRow, readOnly: ReadOnlyMode | null): ContainerView
     serviceId: row.service_id,
     url: row.domain ? `https://${row.domain}` : null,
     createdAt: row.created_at.toISOString(),
+    expiresAt: new Date(row.created_at.getTime() + CONTAINER_LIFETIME_MS).toISOString(),
     activeOperation:
       isActive(row.op_status) && row.op_id && row.op_kind && row.op_status ? { id: row.op_id, kind: row.op_kind, status: row.op_status } : null,
     lastError: row.op_status === "failed" && row.op_error ? { message: row.op_error, traceId: row.op_trace_id } : null,
@@ -246,6 +262,7 @@ export class ContainerControl {
     );
     if (this.#readOnly) {
       if (rows.length > 0) log(`not reconciling ${rows.length} operation(s) left active by a previous process: read-only mode`);
+      log("container lifetimes are not enforced: read-only mode");
       await this.#observer.start();
       return;
     }
@@ -260,6 +277,55 @@ export class ContainerControl {
       else if (op.kind === "create") this.#trackDrive(op.container_id, (signal) => this.#driveCreate(op.id, signal, { resume: true }));
       else if (op.kind === "stop") this.#trackDrive(op.container_id, (signal) => this.#driveStop(op.id, signal, { resume: true }));
       else this.#trackDrive(op.container_id, (signal) => this.#driveStart(op.id, signal, { resume: true }));
+    }
+    this.#startLifetimeSweep();
+  }
+
+  /**
+   * Destroy every container past its lifetime: once now, which covers the ones that
+   * expired while the app was down, and then every minute. Runs never overlap.
+   */
+  #startLifetimeSweep(): void {
+    let running = false;
+    const run = () => {
+      if (running) return;
+      running = true;
+      void this.#track(this.#sweepExpired()).finally(() => {
+        running = false;
+      });
+    };
+    run();
+    this.#deps.clock.every(LIFETIME_SWEEP_MS, run, this.#closing.signal);
+  }
+
+  /**
+   * A Destroy for each expired container that is not being destroyed yet. It goes through
+   * the same request path as a click, so the row lock and the one-active-Destroy index
+   * keep two sweeps (two instances, or a click at the same moment) from destroying twice.
+   * A Destroy Railway rejected leaves the container failed; the next sweep tries again.
+   */
+  async #sweepExpired(): Promise<void> {
+    const { db, clock } = this.#deps;
+    const log = this.#deps.log ?? console.error;
+    const cutoff = new Date(clock.now().getTime() - CONTAINER_LIFETIME_MS);
+    const { rows } = await db.query<{ id: string; name: string }>(
+      `SELECT c.id, c.name FROM containers c
+       WHERE c.destroyed_at IS NULL AND c.created_at <= $1
+         AND NOT EXISTS (
+           SELECT 1 FROM operations o
+           WHERE o.container_id = c.id AND o.kind = 'destroy' AND o.status IN ('pending', 'in_progress'))
+       ORDER BY c.created_at, c.id`,
+      [cutoff],
+    );
+    for (const { id, name } of rows) {
+      try {
+        await this.requestAction(id, "destroy", `lifetime-${randomUUID()}`);
+        log(`lifetime: destroying ${name}, created more than ${CONTAINER_LIFETIME_MS / 60_000} minutes ago`);
+      } catch (error) {
+        // Destroyed or being destroyed by someone else since the query above.
+        if (error instanceof ActionRefused || error instanceof ContainerNotFound) continue;
+        log(`lifetime: could not destroy ${name}: ${error instanceof Error ? error.message : String(error)}`);
+      }
     }
   }
 
@@ -289,6 +355,14 @@ export class ContainerControl {
     const now = clock.now();
     try {
       await transaction(db, async (client) => {
+        // Held until commit: the count below and the insert are one step for every concurrent create.
+        await client.query("SELECT pg_advisory_xact_lock($1)", [CREATE_LOCK]);
+        // A replay first, so resending the click that made the fifth container still answers with it.
+        const seen = await client.query("SELECT 1 FROM operations WHERE idempotency_key = $1", [idempotencyKey]);
+        if ((seen.rowCount ?? 0) > 0) throw new Replay();
+        // A container counts until it is destroyed: stopped, failed or being destroyed, it still holds a service slot.
+        const { rows } = await client.query<{ n: number }>("SELECT count(*)::int AS n FROM containers WHERE destroyed_at IS NULL");
+        if ((rows[0]?.n ?? 0) >= CONTAINER_LIMIT) throw new ContainerLimitReached(CONTAINER_LIMIT_MESSAGE);
         await client.query("INSERT INTO containers (id, name, created_at) VALUES ($1, $2, $3)", [
           containerId,
           serviceNameFor(operationId),

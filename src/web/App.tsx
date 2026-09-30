@@ -15,6 +15,31 @@ import {
 const RECHECK_MS = 2_000;
 const ACTION_LABEL: Record<ContainerAction, string> = { stop: "Stop", start: "Start", destroy: "Destroy" };
 const READ_ONLY_BANNER_ID = "read-only-banner";
+const LIMIT_HINT_ID = "limit-hint";
+
+/** The current time, updated every second, for countdowns. */
+function useNow(): number {
+  const [now, setNow] = useState(() => Date.now());
+  useEffect(() => {
+    const timer = setInterval(() => setNow(Date.now()), 1_000);
+    return () => clearInterval(timer);
+  }, []);
+  return now;
+}
+
+/** Time left until the lifetime sweep destroys the container, as m:ss. */
+function Countdown({ expiresAt, now }: { expiresAt: string; now: number }) {
+  const left = Math.max(0, Date.parse(expiresAt) - now);
+  const minutes = Math.floor(left / 60_000);
+  const seconds = Math.floor((left % 60_000) / 1_000);
+  const label = left === 0 ? "Expiring…" : `${minutes}:${String(seconds).padStart(2, "0")}`;
+  // Not a live region: a screen reader announcing every second would be noise. The deadline is in the title.
+  return (
+    <time dateTime={expiresAt} title={`Destroyed at ${new Date(expiresAt).toLocaleTimeString()}`}>
+      {label}
+    </time>
+  );
+}
 
 /**
  * Stop, Start and Destroy for one container. Availability comes from the server,
@@ -146,6 +171,8 @@ export function App() {
 function Containers({ onStreamClosed, onSessionEnded }: { onStreamClosed: () => void; onSessionEnded: () => void }) {
   const [containers, setContainers] = useState<Container[] | null>(null);
   const [readOnly, setReadOnly] = useState<ReadOnlyMode | null>(null);
+  const [containerLimit, setContainerLimit] = useState<number | null>(null);
+  const now = useNow();
   const [connected, setConnected] = useState(true);
   const [error, setError] = useState<string | null>(null);
   const [creating, setCreating] = useState(false);
@@ -156,7 +183,10 @@ function Containers({ onStreamClosed, onSessionEnded }: { onStreamClosed: () => 
     () =>
       subscribeToContainers({
         onEvent: (event) => {
-          if (event.type === "snapshot") setReadOnly(event.readOnly);
+          if (event.type === "snapshot") {
+            setReadOnly(event.readOnly);
+            setContainerLimit(event.containerLimit);
+          }
           setContainers((list) => applyEvent(list, event));
         },
         onConnection: setConnected,
@@ -199,6 +229,10 @@ function Containers({ onStreamClosed, onSessionEnded }: { onStreamClosed: () => 
     }
   };
 
+  // A hint only: the server refuses the create either way, with its own message.
+  const atLimit = containerLimit !== null && containers !== null && containers.length >= containerLimit;
+  const createHintId = readOnly ? READ_ONLY_BANNER_ID : atLimit ? LIMIT_HINT_ID : undefined;
+
   return (
     <main>
       <header>
@@ -208,11 +242,16 @@ function Containers({ onStreamClosed, onSessionEnded }: { onStreamClosed: () => 
             type="button"
             className="primary"
             onClick={() => void onCreate()}
-            disabled={creating || readOnly !== null}
-            aria-describedby={readOnly ? READ_ONLY_BANNER_ID : undefined}
+            disabled={creating || readOnly !== null || atLimit}
+            aria-describedby={createHintId}
           >
             {creating ? "Creating…" : "Create container"}
           </button>
+          {atLimit && !readOnly && (
+            <small id={LIMIT_HINT_ID} className="hint">
+              {containerLimit} of {containerLimit} containers in use (stopped ones count). Destroy one to create another.
+            </small>
+          )}
         </div>
       </header>
 
@@ -247,6 +286,7 @@ function Containers({ onStreamClosed, onSessionEnded }: { onStreamClosed: () => 
               <th scope="col">State</th>
               <th scope="col">Public URL</th>
               <th scope="col">Created</th>
+              <th scope="col">Time left</th>
               <th scope="col">Actions</th>
             </tr>
           </thead>
@@ -277,6 +317,9 @@ function Containers({ onStreamClosed, onSessionEnded }: { onStreamClosed: () => 
                 </td>
                 <td>
                   <time dateTime={c.createdAt}>{new Date(c.createdAt).toLocaleTimeString()}</time>
+                </td>
+                <td>
+                  <Countdown expiresAt={c.expiresAt} now={now} />
                 </td>
                 <td>
                   <ContainerActions

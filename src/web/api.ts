@@ -21,6 +21,8 @@ export type Container = {
   state: ContainerState;
   url: string | null;
   createdAt: string;
+  /** When the server's lifetime sweep destroys it. */
+  expiresAt: string;
   lastError: { message: string; traceId: string | null } | null;
   /** Decided by the server with the same rule that refuses a request. */
   actions: Record<ContainerAction, Availability>;
@@ -30,8 +32,8 @@ export type Container = {
 export type ReadOnlyMode = { reason: string };
 
 export type LiveEvent =
-  /** `readOnly` is fixed until the server restarts, so the snapshot is the only event that carries it. */
-  | { type: "snapshot"; containers: Container[]; readOnly: ReadOnlyMode | null }
+  /** `readOnly` is fixed until the server restarts, so the snapshot is the only event that carries it; the limit too. */
+  | { type: "snapshot"; containers: Container[]; readOnly: ReadOnlyMode | null; containerLimit: number }
   | { type: "upsert"; container: Container }
   | { type: "remove"; id: string };
 
