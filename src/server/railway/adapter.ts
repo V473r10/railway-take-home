@@ -38,8 +38,12 @@ export type DeploymentWatch = {
 
 export interface RailwayAdapter {
   createContainer(input: CreateContainerInput): Promise<Outcome<CreatedService>>;
+  /** The service with this name in the sandbox project, or null. How an ambiguous create is resolved (ADR 0004). */
+  findService(name: string): Promise<Outcome<CreatedService | null>>;
   /** Give the service a public Railway domain routed to the image's port. */
   createDomain(serviceId: string): Promise<Outcome<PublicDomain>>;
+  /** The service's public Railway domain, or null while it has none. */
+  serviceDomain(serviceId: string): Promise<Outcome<PublicDomain | null>>;
   /** The service's newest deployment, or null while Railway has not started one yet. */
   latestDeployment(serviceId: string): Promise<Outcome<DeploymentState | null>>;
   readDeployment(deploymentId: string): Promise<Outcome<DeploymentState>>;

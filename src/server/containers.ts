@@ -2,6 +2,7 @@ import { randomUUID } from "node:crypto";
 import type { Clock } from "./clock.ts";
 import { type Db, transaction } from "./db.ts";
 import { Observer } from "./observer.ts";
+import { type Lookup, lookupFrom, withRetries } from "./retry.ts";
 import {
   CONTAINER_IMAGE,
   DEPLOYMENT_FAILED_STATUSES,
@@ -148,6 +149,14 @@ const CONTAINERS_SQL = `
 
 class Replay extends Error {}
 
+type BegunOperation = { container_id: string; name: string; service_id: string | null; deployment_id: string | null };
+
+const RETRY = { kind: "retry" } as const;
+
+function done<T>(value: T): Lookup<T> {
+  return { kind: "done", outcome: { kind: "ok", value } };
+}
+
 /** A Postgres unique violation of one named constraint or index. */
 function isUniqueViolation(error: unknown, constraint: string): boolean {
   return (
@@ -277,7 +286,7 @@ export class ContainerControl {
     }
     this.#publish(containerId);
     if (action === "destroy") this.#track(this.#driveDestroy(operationId, containerId));
-    else if (action === "stop") this.#trackDrive(containerId, () => this.#driveStop(operationId));
+    else if (action === "stop") this.#trackDrive(containerId, (signal) => this.#driveStop(operationId, signal));
     else this.#trackDrive(containerId, (signal) => this.#driveStart(operationId, signal));
     return this.#result(operationId, false);
   }
@@ -333,14 +342,23 @@ export class ContainerControl {
     const op = rows[0];
     if (!op) return;
 
-    const created = await railway.createContainer({ name: op.name, image: CONTAINER_IMAGE });
+    // serviceCreate takes no idempotency key, so before repeating a create that may have
+    // acted, look for the service by the name this operation gave it (ADR 0004).
+    const created = await this.#call(operationId, () => railway.createContainer({ name: op.name, image: CONTAINER_IMAGE }), {
+      signal,
+      lookup: async () => lookupFrom(await railway.findService(op.name), (found) => (found ? done(found) : RETRY)),
+    });
     if (created.kind !== "ok") return this.#unsuccessful(operationId, op.container_id, created, "creating the service");
     // Recorded even when a Destroy is waiting, so the Destroy knows which service to delete.
     await db.query("UPDATE containers SET service_id = $2 WHERE id = $1", [op.container_id, created.value.serviceId]);
     if (signal.aborted) return;
 
     // The domain comes before observing, so a container is never shown running without its URL.
-    const domain = await railway.createDomain(created.value.serviceId);
+    const serviceId = created.value.serviceId;
+    const domain = await this.#call(operationId, () => railway.createDomain(serviceId), {
+      signal,
+      lookup: async () => lookupFrom(await railway.serviceDomain(serviceId), (found) => (found ? done(found) : RETRY)),
+    });
     if (domain.kind === "ok") {
       await db.query("UPDATE containers SET domain = $2 WHERE id = $1", [op.container_id, domain.value.domain]);
       this.#publish(op.container_id);
@@ -355,13 +373,13 @@ export class ContainerControl {
   async #begin(
     operationId: string,
     { clearDeployment = false } = {},
-  ): Promise<{ container_id: string; service_id: string | null; deployment_id: string | null } | null> {
+  ): Promise<BegunOperation | null> {
     const { db, clock } = this.#deps;
     return transaction(db, async (client) => {
-      const { rows } = await client.query<{ container_id: string; service_id: string | null; deployment_id: string | null }>(
+      const { rows } = await client.query<BegunOperation>(
         `UPDATE operations o SET status = 'in_progress', attempts = attempts + 1, updated_at = $2
          FROM containers c WHERE o.id = $1 AND c.id = o.container_id AND o.status = 'pending'
-         RETURNING o.container_id, c.service_id, c.current_deployment_id AS deployment_id`,
+         RETURNING o.container_id, c.name, c.service_id, c.current_deployment_id AS deployment_id`,
         [operationId, clock.now()],
       );
       const op = rows[0];
@@ -371,11 +389,16 @@ export class ContainerControl {
   }
 
   /** A Stop completes when the observer sees the deployment stopped. */
-  async #driveStop(operationId: string): Promise<void> {
+  async #driveStop(operationId: string, signal: AbortSignal): Promise<void> {
+    const { railway } = this.#deps;
     const op = await this.#begin(operationId);
     if (!op) return;
-    if (!op.deployment_id) return this.#failAndPublish(operationId, op.container_id, "The container has no deployment to stop.");
-    const stopped = await this.#deps.railway.stopDeployment(op.deployment_id);
+    const deploymentId = op.deployment_id;
+    if (!deploymentId) return this.#failAndPublish(operationId, op.container_id, "The container has no deployment to stop.");
+    const stopped = await this.#call(operationId, () => railway.stopDeployment(deploymentId), {
+      signal,
+      lookup: async () => lookupFrom(await railway.readDeployment(deploymentId), (state) => (state.stopped ? done(undefined) : RETRY)),
+    });
     if (stopped.kind !== "ok") return this.#unsuccessful(operationId, op.container_id, stopped, "stopping the deployment");
   }
 
@@ -403,7 +426,14 @@ export class ContainerControl {
       return this.#failAndPublish(operationId, op.container_id, "The container has no Railway service to start.");
     }
 
-    const redeployed = await railway.redeployService(serviceId);
+    // A redeploy that acted shows up as a newer deployment; only without one is it repeated.
+    const redeployed = await this.#call(operationId, () => railway.redeployService(serviceId), {
+      signal,
+      lookup: async () =>
+        lookupFrom(await railway.latestDeployment(serviceId), (latest) =>
+          latest && latest.deploymentId !== op.deployment_id ? done(undefined) : RETRY,
+        ),
+    });
     if (redeployed.kind === "rejected" || redeployed.kind === "rate_limited") {
       // Railway did not act: the old deployment is still the current one.
       await restore();
@@ -477,10 +507,23 @@ export class ContainerControl {
     );
     this.#observer.untrack(containerId);
 
-    // No service means Railway never confirmed one. After an ambiguous create one may still
-    // exist under the container's name; finding it is the name lookup's job (retries ticket).
-    if (op.service_id) {
-      const deleted = await railway.deleteService(op.service_id);
+    let serviceId = op.service_id;
+    if (!serviceId && (await this.#createWasAmbiguous(containerId))) {
+      // Railway never confirmed a service, but the create may have made one: it has the container's name.
+      const found = await this.#call(operationId, () => railway.findService(op.name), { signal: this.#closing.signal });
+      if (found.kind !== "ok") {
+        this.#observer.track(containerId);
+        return this.#unsuccessful(operationId, containerId, found, "looking for the service");
+      }
+      serviceId = found.value?.serviceId ?? null;
+    }
+    if (serviceId) {
+      const target = serviceId;
+      // A delete that acted leaves no service with the container's name; only then is it not repeated.
+      const deleted = await this.#call(operationId, () => railway.deleteService(target), {
+        signal: this.#closing.signal,
+        lookup: async () => lookupFrom(await railway.findService(op.name), (found) => (found ? RETRY : done(undefined))),
+      });
       if (deleted.kind !== "ok") {
         this.#observer.track(containerId);
         return this.#unsuccessful(operationId, containerId, deleted, "deleting the service");
@@ -510,12 +553,12 @@ export class ContainerControl {
         await this.#fail(operationId, outcome.message, outcome.traceId);
         break;
       case "rate_limited":
-        // Railway did not act. Retrying is the retries ticket's job.
+        // Railway did not act, and still refused after every retry.
         await this.#fail(operationId, "Railway rate limit reached; try again shortly.", null);
         break;
       case "ambiguous":
-        // Railway may have acted. Leave the operation active and flagged, so the name lookup
-        // (retries ticket) or the startup reconciler can resolve it instead of guessing.
+        // Railway may have acted and every retry went unanswered. Leave the operation active
+        // and flagged, so the startup reconciler can resolve it instead of guessing.
         await this.#deps.db.query(
           "UPDATE operations SET last_outcome_ambiguous = true, last_error = $2, updated_at = $3 WHERE id = $1",
           [operationId, `No response from Railway while ${step}: ${outcome.reason}`, this.#deps.clock.now()],
@@ -550,6 +593,43 @@ export class ContainerControl {
       settled = result.rowCount ?? 0;
     }
     if (changed || settled > 0) this.#publish(containerId);
+  }
+
+  /**
+   * One call to Railway under the retry policy (ADR 0004). While an attempt's outcome is
+   * unknown the operation stays flagged in the database, so a process that dies mid-retry
+   * leaves the reconciler a trace; the flag is cleared once Railway's answer is known.
+   */
+  async #call<T>(
+    operationId: string,
+    call: () => Promise<Outcome<T>>,
+    options: { signal: AbortSignal; lookup?: () => Promise<Lookup<T>> },
+  ): Promise<Outcome<T>> {
+    const { db, clock } = this.#deps;
+    let flagged = false;
+    const outcome = await withRetries(call, {
+      clock,
+      signal: options.signal,
+      lookup: options.lookup,
+      onAmbiguous: async () => {
+        if (flagged) return;
+        flagged = true;
+        await db.query("UPDATE operations SET last_outcome_ambiguous = true, updated_at = $2 WHERE id = $1", [operationId, clock.now()]);
+      },
+    });
+    if (flagged && outcome.kind !== "ambiguous") {
+      await db.query("UPDATE operations SET last_outcome_ambiguous = false WHERE id = $1", [operationId]);
+    }
+    return outcome;
+  }
+
+  /** Whether the container's create ended without Railway ever answering it. */
+  async #createWasAmbiguous(containerId: string): Promise<boolean> {
+    const { rows } = await this.#deps.db.query<{ ambiguous: boolean }>(
+      "SELECT last_outcome_ambiguous AS ambiguous FROM operations WHERE container_id = $1 AND kind = 'create'",
+      [containerId],
+    );
+    return rows[0]?.ambiguous === true;
   }
 
   #publish(containerId: string): void {

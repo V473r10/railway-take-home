@@ -85,6 +85,28 @@ export class GraphqlRailway implements RailwayAdapter {
     return mapOk(outcome, (d) => ({ domain: d.serviceDomainCreate.domain }));
   }
 
+  async findService(name: string): Promise<Outcome<CreatedService | null>> {
+    const outcome = await this.#request<{ project: { services: { edges: { node: { id: string; name: string } }[] } } }>(
+      "query($id:String!){ project(id:$id){ services{ edges{ node{ id name } } } } }",
+      { id: this.#config.projectId },
+    );
+    return mapOk(outcome, (d) => {
+      const node = d.project.services.edges.find((e) => e.node.name === name)?.node;
+      return node ? { serviceId: node.id } : null;
+    });
+  }
+
+  async serviceDomain(serviceId: string): Promise<Outcome<PublicDomain | null>> {
+    const outcome = await this.#request<{ domains: { serviceDomains: { domain: string }[] } }>(
+      "query($p:String!,$e:String!,$s:String!){ domains(projectId:$p, environmentId:$e, serviceId:$s){ serviceDomains{ domain } } }",
+      { p: this.#config.projectId, e: this.#config.environmentId, s: serviceId },
+    );
+    return mapOk(outcome, (d) => {
+      const first = d.domains.serviceDomains[0];
+      return first ? { domain: first.domain } : null;
+    });
+  }
+
   async latestDeployment(serviceId: string): Promise<Outcome<DeploymentState | null>> {
     const outcome = await this.#request<{ deployments: { edges: { node: GqlDeployment }[] } }>(
       `query($input:DeploymentListInput!){ deployments(input:$input, first:1){ edges{ node{ ${DEPLOYMENT_FIELDS} } } } }`,
