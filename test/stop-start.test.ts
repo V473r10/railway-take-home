@@ -68,9 +68,13 @@ describe("stopping and starting a container", () => {
     await tab.next(upsert(id, "starting"));
     await h.settled();
     h.railway.setDeployment(serviceId, "SUCCESS");
-    const runningEvents = () => tab.events.filter(upsert(id, "running")) as Extract<LiveEvent, { type: "upsert" }>[];
-    await eventually(() => runningEvents().length === 2);
-    expect(runningEvents()[1]?.container.url).toMatch(/^https:\/\//);
+    // Only the events after Start count: each change is read from the database when it is
+    // sent, so a busy machine can send the first running state more than once.
+    const startedAt = tab.events.findIndex(upsert(id, "starting"));
+    const runningAgain = () =>
+      tab.events.slice(startedAt).filter(upsert(id, "running")) as Extract<LiveEvent, { type: "upsert" }>[];
+    await eventually(() => runningAgain().length > 0);
+    expect(runningAgain()[0]?.container.url).toMatch(/^https:\/\//);
   });
 
   it("tracks the new deployment after Start", async () => {

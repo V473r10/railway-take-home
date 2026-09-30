@@ -202,6 +202,9 @@ class ProcessRailway implements RailwayAdapter {
   findService(name: string) {
     return this.#forward("findService", () => this.#railway.findService(name));
   }
+  listServices() {
+    return this.#forward("listServices", () => this.#railway.listServices());
+  }
   createDomain(serviceId: string) {
     return this.#forward("createDomain", () => this.#railway.createDomain(serviceId));
   }

@@ -76,6 +76,9 @@ export const CONTAINER_LIFETIME_MS = 30 * 60 * 1000;
 /** How often the lifetime sweep runs, besides once at startup. */
 export const LIFETIME_SWEEP_MS = 60 * 1000;
 export const CONTAINER_LIMIT_MESSAGE = `The limit of ${CONTAINER_LIMIT} containers is reached (stopped ones count). Destroy one to create another.`;
+/** How often the app checks that every container's service still exists, besides once at startup. */
+export const MISSING_SWEEP_MS = 60 * 1000;
+export const MISSING_MESSAGE = "The service was deleted outside this app. Destroy the container to remove it.";
 // Serializes every create's count-then-insert, so concurrent creates cannot pass the limit together.
 const CREATE_LOCK = 7_202_605;
 
@@ -106,24 +109,38 @@ type ContainerRow = {
   domain: string | null;
   observed_status: string | null;
   observed_stopped: boolean | null;
+  /** When the observed state last changed. */
+  observed_at: Date | null;
+  /** The service was found deleted outside the app. */
+  missing: boolean;
   created_at: Date;
   op_id: string | null;
   op_kind: OperationKind | null;
   op_status: OperationStatus | null;
   op_error: string | null;
   op_trace_id: string | null;
+  op_updated_at: Date | null;
 };
 
 function isActive(status: OperationStatus | null): boolean {
   return status === "pending" || status === "in_progress";
 }
 
-/** Container state as the user sees it: an active operation first, then the last failure, then what Railway reported. */
+/**
+ * Container state as the user sees it: an active operation first, then a service
+ * deleted outside the app, then the last failure, then what Railway reported. A crash
+ * Railway reports after that failure is newer than it, so observed state wins (Q11).
+ */
 export function deriveState(row: ContainerRow): ContainerState {
   if (isActive(row.op_status) && row.op_kind) return TRANSITIONAL[row.op_kind];
-  if (row.op_status === "failed") return "failed";
+  if (row.missing) return "missing";
+  const crashed = row.observed_status === "CRASHED";
+  if (row.op_status === "failed") {
+    const crashedSince = crashed && row.observed_at !== null && row.op_updated_at !== null && row.observed_at > row.op_updated_at;
+    return crashedSince ? "crashed" : "failed";
+  }
   if (row.observed_status === "SUCCESS") return row.observed_stopped ? "stopped" : "running";
-  if (row.observed_status === "CRASHED") return "crashed";
+  if (crashed) return "crashed";
   return "creating";
 }
 
@@ -139,6 +156,7 @@ export function availability(row: ContainerRow, action: ContainerAction): Availa
     return isActive(row.op_status) && row.op_kind === "destroy" ? refuse("The container is already being destroyed.") : { allowed: true };
   }
   if (isActive(row.op_status) && row.op_kind) return refuse(`Wait for ${LABEL[row.op_kind]} to finish.`);
+  if (row.missing) return refuse(MISSING_MESSAGE);
   if (!row.service_id) return refuse("This container has no Railway service.");
   const running = row.observed_status === "SUCCESS" && row.observed_stopped === false;
   if (action === "stop") return running ? { allowed: true } : refuse("Only a running container can be stopped.");
@@ -155,20 +173,23 @@ function toView(row: ContainerRow, readOnly: ReadOnlyMode | null): ContainerView
     name: row.name,
     state: deriveState(row),
     serviceId: row.service_id,
-    url: row.domain ? `https://${row.domain}` : null,
+    url: row.domain && !row.missing ? `https://${row.domain}` : null,
     createdAt: row.created_at.toISOString(),
     expiresAt: new Date(row.created_at.getTime() + CONTAINER_LIFETIME_MS).toISOString(),
     activeOperation:
       isActive(row.op_status) && row.op_id && row.op_kind && row.op_status ? { id: row.op_id, kind: row.op_kind, status: row.op_status } : null,
-    lastError: row.op_status === "failed" && row.op_error ? { message: row.op_error, traceId: row.op_trace_id } : null,
+    // A missing container says why through its actions' reason; an older failure is beside the point.
+    lastError: !row.missing && row.op_status === "failed" && row.op_error ? { message: row.op_error, traceId: row.op_trace_id } : null,
     actions: { stop: actionAvailability("stop"), start: actionAvailability("start"), destroy: actionAvailability("destroy") },
   };
 }
 
 // Each container with its most recent operation.
 const CONTAINERS_SQL = `
-  SELECT c.id, c.name, c.service_id, c.domain, c.observed_status, c.observed_stopped, c.created_at,
-         o.id AS op_id, o.kind AS op_kind, o.status AS op_status, o.last_error AS op_error, o.last_trace_id AS op_trace_id
+  SELECT c.id, c.name, c.service_id, c.domain, c.observed_status, c.observed_stopped, c.observed_at,
+         c.missing_at IS NOT NULL AS missing, c.created_at,
+         o.id AS op_id, o.kind AS op_kind, o.status AS op_status, o.last_error AS op_error, o.last_trace_id AS op_trace_id,
+         o.updated_at AS op_updated_at
   FROM containers c
   LEFT JOIN LATERAL (
     SELECT * FROM operations WHERE container_id = c.id ORDER BY seq DESC LIMIT 1
@@ -186,6 +207,8 @@ type BegunOperation = {
   deployment_id: string | null;
   /** A Start's: the deployment its redeploy replaces. */
   replaced_deployment_id: string | null;
+  /** The container's service was found deleted outside the app. */
+  missing: boolean;
   /** A previous process already began this operation and stopped before it finished. */
   resumed: boolean;
 };
@@ -224,6 +247,7 @@ export class ContainerControl {
   /** Per container, the drive in flight for it, so a Destroy can interrupt it and wait for it. */
   readonly #drives = new Map<string, { done: Promise<void>; abort: AbortController }>();
   #readOnly: ReadOnlyMode | null = null;
+  readonly #missingSweep = { running: false, again: false };
 
   constructor(deps: ContainerControlDeps) {
     this.#deps = deps;
@@ -233,11 +257,13 @@ export class ContainerControl {
       clock: deps.clock,
       log: deps.log ?? console.error,
       onObserved: (id, state, changed) => this.#onObserved(id, state, changed),
+      onSuspectGone: () => this.#checkMissing(),
     });
   }
 
   /**
-   * Confirm who the Railway token belongs to, reconcile, then observe.
+   * Confirm who the Railway token belongs to, find services deleted while the app
+   * was down, reconcile, then observe.
    *
    * An unconfirmed token puts the app in read-only mode instead of failing the
    * start (ADR 0003). Observing only reads, so it runs either way; reconciling
@@ -257,6 +283,9 @@ export class ContainerControl {
       this.#readOnly = { reason: readOnlyReason(identity) };
       log(`read-only mode: ${this.#readOnly.reason}`);
     }
+    // First, and before accepting requests: services deleted while the app was down are
+    // found missing, and their operations failed instead of resumed.
+    await this.#track(this.#sweepMissing());
     const { rows } = await this.#deps.db.query<{ id: string; kind: OperationKind; container_id: string }>(
       "SELECT id, kind, container_id FROM operations WHERE status IN ('pending', 'in_progress') ORDER BY seq",
     );
@@ -264,6 +293,7 @@ export class ContainerControl {
       if (rows.length > 0) log(`not reconciling ${rows.length} operation(s) left active by a previous process: read-only mode`);
       log("container lifetimes are not enforced: read-only mode");
       await this.#observer.start();
+      this.#startMissingSweep();
       return;
     }
     // A Destroy supersedes whatever else its container was doing; only the Destroy is resumed.
@@ -279,6 +309,83 @@ export class ContainerControl {
       else this.#trackDrive(op.container_id, (signal) => this.#driveStart(op.id, signal, { resume: true }));
     }
     this.#startLifetimeSweep();
+    this.#startMissingSweep();
+  }
+
+  /**
+   * Check every container's service still exists every minute (and once at startup,
+   * in `start`), and whenever the observer suspects one is gone. Only reads, so it
+   * runs in read-only mode too.
+   */
+  #startMissingSweep(): void {
+    this.#deps.clock.every(MISSING_SWEEP_MS, () => this.#checkMissing(), this.#closing.signal);
+  }
+
+  /** Run the missing sweep, or once more after the one running now: its listing may predate the suspicion. */
+  #checkMissing(): void {
+    const sweep = this.#missingSweep;
+    if (this.#closing.signal.aborted) return;
+    if (sweep.running) {
+      sweep.again = true;
+      return;
+    }
+    sweep.running = true;
+    const run = async () => {
+      do {
+        sweep.again = false;
+        await this.#sweepMissing();
+      } while (sweep.again && !this.#closing.signal.aborted);
+    };
+    void this.#track(run()).finally(() => {
+      sweep.running = false;
+    });
+  }
+
+  /**
+   * Mark missing each container whose service is not in the sandbox project anymore
+   * (deleted from the Railway dashboard). Railway is the truth (Q11): the app does not
+   * recreate it; the container stays listed as missing until it is destroyed, and any
+   * operation it had in flight fails. Only containers with a row are judged; other
+   * services in the sandbox are never looked at, whatever their name.
+   */
+  async #sweepMissing(): Promise<void> {
+    const { db, railway, clock } = this.#deps;
+    const log = this.#deps.log ?? console.error;
+    // Read before listing: a service recorded after this read may be too new for the
+    // listing below, so only the ones recorded before it are judged.
+    const { rows } = await db.query<{ id: string; name: string; service_id: string }>(
+      "SELECT id, name, service_id FROM containers WHERE destroyed_at IS NULL AND missing_at IS NULL AND service_id IS NOT NULL",
+    );
+    if (rows.length === 0) return;
+    const listed = await railway.listServices();
+    if (listed.kind !== "ok") {
+      // Nothing is concluded from a failed listing; the next sweep asks again.
+      log(`missing sweep: could not list the sandbox services: ${listed.kind}`);
+      return;
+    }
+    const present = new Set(listed.value.map((s) => s.serviceId));
+    for (const row of rows) {
+      if (present.has(row.service_id)) continue;
+      const marked = await transaction(db, async (client) => {
+        const now = clock.now();
+        const updated = await client.query(
+          "UPDATE containers SET missing_at = $3 WHERE id = $1 AND service_id = $2 AND destroyed_at IS NULL AND missing_at IS NULL",
+          [row.id, row.service_id, now],
+        );
+        if (updated.rowCount === 0) return false;
+        // A Destroy in flight carries on: it knows the service is gone and just records it.
+        await client.query(
+          `UPDATE operations SET status = 'failed', last_error = $2, last_outcome_ambiguous = false, updated_at = $3
+           WHERE container_id = $1 AND kind <> 'destroy' AND status IN ('pending', 'in_progress')`,
+          [row.id, MISSING_MESSAGE, now],
+        );
+        return true;
+      });
+      if (!marked) continue;
+      log(`missing: ${row.name} (${row.service_id}) is not in the sandbox project anymore`);
+      this.#observer.untrack(row.id);
+      this.#publish(row.id);
+    }
   }
 
   /**
@@ -549,7 +656,8 @@ export class ContainerControl {
       const { rows } = await client.query<Omit<BegunOperation, "resumed">>(
         `UPDATE operations o SET status = 'in_progress', attempts = attempts + 1, updated_at = $2
          FROM containers c WHERE o.id = $1 AND c.id = o.container_id
-         RETURNING o.container_id, c.name, c.service_id, c.domain, c.current_deployment_id AS deployment_id, o.replaced_deployment_id`,
+         RETURNING o.container_id, c.name, c.service_id, c.domain, c.current_deployment_id AS deployment_id, o.replaced_deployment_id,
+                   c.missing_at IS NOT NULL AS missing`,
         [operationId, clock.now()],
       );
       const row = rows[0];
@@ -713,10 +821,11 @@ export class ContainerControl {
     );
     this.#observer.untrack(containerId);
 
-    let serviceId = op.service_id;
+    // A missing container's service is already gone: there is nothing to delete, only the row to close.
+    let serviceId = op.missing ? null : op.service_id;
     // A resumed Destroy may have deleted the service already, and a create Railway never
     // confirmed may have made one anyway. Either way the container's name tells.
-    if (op.resumed || (!serviceId && (await this.#createWasAmbiguous(containerId)))) {
+    if (!op.missing && (op.resumed || (!serviceId && (await this.#createWasAmbiguous(containerId))))) {
       const found = await this.#call(operationId, () => railway.findService(op.name), { signal: this.#closing.signal });
       if (found.kind !== "ok") {
         this.#observer.track(containerId);

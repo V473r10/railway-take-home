@@ -12,6 +12,12 @@ export type ObserverDeps = {
   clock: Clock;
   /** Called after each observation is stored; `changed` says whether the stored state moved. */
   onObserved: (containerId: string, state: DeploymentState, changed: boolean) => Promise<void>;
+  /**
+   * Railway says the container's deployment was removed, or refuses to read it: its
+   * service may have been deleted outside the app. The observer cannot tell that from
+   * a Railway hiccup, so it only reports the suspicion; the caller checks the service list.
+   */
+  onSuspectGone: (containerId: string) => void;
   log: (msg: string) => void;
 };
 
@@ -38,7 +44,7 @@ export class Observer {
    */
   async start(except: ReadonlySet<string> = new Set()): Promise<void> {
     const { rows } = await this.#deps.db.query<{ id: string }>(
-      "SELECT id FROM containers WHERE service_id IS NOT NULL AND destroyed_at IS NULL",
+      "SELECT id FROM containers WHERE service_id IS NOT NULL AND destroyed_at IS NULL AND missing_at IS NULL",
     );
     for (const row of rows) if (!except.has(row.id)) this.track(row.id);
   }
@@ -87,9 +93,9 @@ export class Observer {
 
   /** The container's current deployment id, asking Railway for it when the database does not know it yet. */
   async #currentDeployment(containerId: string, signal: AbortSignal): Promise<string | null> {
-    const { db, railway, clock, log } = this.#deps;
+    const { db, railway, clock, log, onSuspectGone } = this.#deps;
     const { rows } = await db.query<{ service_id: string | null; current_deployment_id: string | null }>(
-      "SELECT service_id, current_deployment_id FROM containers WHERE id = $1 AND destroyed_at IS NULL",
+      "SELECT service_id, current_deployment_id FROM containers WHERE id = $1 AND destroyed_at IS NULL AND missing_at IS NULL",
       [containerId],
     );
     const row = rows[0];
@@ -107,8 +113,8 @@ export class Observer {
         return outcome.value.deploymentId;
       }
       if (outcome.kind === "rejected") {
-        // The service is gone or unreadable; telling "missing" apart is the observed-state ticket's job.
         log(`observer: cannot read deployments of ${row.service_id}: ${outcome.message}`);
+        onSuspectGone(containerId);
         return null;
       }
       // No deployment yet, rate limited, or no response: wait and ask again.
@@ -152,6 +158,7 @@ export class Observer {
       // ... then read. A push that arrives while the read is in flight is newer, so the read is dropped.
       store(async () => {
         const outcome = await railway.readDeployment(deploymentId);
+        if (outcome.kind === "rejected") this.#deps.onSuspectGone(containerId);
         if (outcome.kind !== "ok") return log(`observer: reading ${deploymentId}: ${outcome.kind}`);
         if (!pushed && !signal.aborted) await this.#store(containerId, outcome.value);
       });
@@ -159,11 +166,15 @@ export class Observer {
   }
 
   async #store(containerId: string, state: DeploymentState): Promise<void> {
+    if (state.status === "REMOVED") this.#deps.onSuspectGone(containerId);
     // Only the current deployment's state counts; a late event from an older deployment is dropped.
+    // `observed_at` is when the observed state last changed, so it can be compared with a failure.
     const { rows } = await this.#deps.db.query<{ changed: boolean }>(
-      `UPDATE containers c SET observed_status = $3, observed_stopped = $4, observed_at = $5
-       FROM (SELECT id, observed_status, observed_stopped FROM containers WHERE id = $1 FOR UPDATE) old
-       WHERE c.id = old.id AND c.current_deployment_id = $2 AND c.destroyed_at IS NULL
+      `UPDATE containers c SET observed_status = $3, observed_stopped = $4,
+         observed_at = CASE WHEN old.observed_status IS DISTINCT FROM $3 OR old.observed_stopped IS DISTINCT FROM $4
+                            THEN $5 ELSE old.observed_at END
+       FROM (SELECT id, observed_status, observed_stopped, observed_at FROM containers WHERE id = $1 FOR UPDATE) old
+       WHERE c.id = old.id AND c.current_deployment_id = $2 AND c.destroyed_at IS NULL AND c.missing_at IS NULL
        RETURNING (old.observed_status IS DISTINCT FROM $3 OR old.observed_stopped IS DISTINCT FROM $4) AS changed`,
       [containerId, state.deploymentId, state.status, state.stopped, this.#deps.clock.now()],
     );
