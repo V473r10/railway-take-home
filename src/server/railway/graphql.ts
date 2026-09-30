@@ -104,6 +104,21 @@ export class GraphqlRailway implements RailwayAdapter {
     return mapOk(outcome, (d) => toState(d.deployment));
   }
 
+  async stopDeployment(deploymentId: string): Promise<Outcome<void>> {
+    const outcome = await this.#request<{ deploymentStop: boolean }>("mutation($id:String!){ deploymentStop(id:$id) }", {
+      id: deploymentId,
+    });
+    return mapOk(outcome, () => undefined);
+  }
+
+  async redeployService(serviceId: string): Promise<Outcome<void>> {
+    const outcome = await this.#request<{ serviceInstanceRedeploy: boolean }>(
+      "mutation($s:String!,$e:String!){ serviceInstanceRedeploy(serviceId:$s, environmentId:$e) }",
+      { s: serviceId, e: this.#config.environmentId },
+    );
+    return mapOk(outcome, () => undefined);
+  }
+
   /**
    * One graphql-transport-ws socket per subscription (at most one per container).
    * Auth goes in `connection_init.payload`, not in a header (M0 spike). Railway

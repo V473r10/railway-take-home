@@ -14,6 +14,8 @@ const ADMIN_URL = process.env.TEST_DATABASE_URL ?? "postgres://postgres@127.0.0.
 export type Harness = {
   railway: FakeRailway;
   clock: ManualClock;
+  /** The app's database, for the few tests that check a guarantee the schema itself must give. */
+  db: Db;
   /** Send a request to the app, as a browser would. */
   request: (path: string, init?: RequestInit) => Promise<Response>;
   /** Wait until every operation started so far has stopped making progress. */
@@ -50,6 +52,7 @@ export async function startHarness(): Promise<Harness> {
   return {
     railway,
     clock,
+    db,
     request: async (path, init) => app.request(path, init),
     settled: () => control.settled(),
     events: async () => {
@@ -76,12 +79,17 @@ export type ContainerBody = {
   serviceId: string | null;
   url: string | null;
   lastError: { message: string; traceId: string | null } | null;
+  actions: Record<"stop" | "start", { allowed: true } | { allowed: false; reason: string }>;
 };
 
 export type CreateBody = { operation: { id: string; kind: string; status: string }; container: ContainerBody };
 
 export function create(h: Harness, idempotencyKey: string = randomUUID()): Promise<Response> {
   return h.request("/api/containers", { method: "POST", headers: { "Idempotency-Key": idempotencyKey } });
+}
+
+export function action(h: Harness, containerId: string, kind: "stop" | "start", idempotencyKey: string = randomUUID()): Promise<Response> {
+  return h.request(`/api/containers/${containerId}/${kind}`, { method: "POST", headers: { "Idempotency-Key": idempotencyKey } });
 }
 
 export async function list(h: Harness): Promise<ContainerBody[]> {

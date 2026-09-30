@@ -43,6 +43,13 @@ export interface RailwayAdapter {
   /** The service's newest deployment, or null while Railway has not started one yet. */
   latestDeployment(serviceId: string): Promise<Outcome<DeploymentState | null>>;
   readDeployment(deploymentId: string): Promise<Outcome<DeploymentState>>;
+  /** Stop a deployment. It keeps `status: SUCCESS` and becomes `stopped` (M0 spike). */
+  stopDeployment(deploymentId: string): Promise<Outcome<void>>;
+  /**
+   * Deploy the service again. Railway answers with a boolean, not the new
+   * deployment: find that with `latestDeployment` (M0 spike).
+   */
+  redeployService(serviceId: string): Promise<Outcome<void>>;
   /** Subscribe to changes of one deployment. Returns the function that ends the subscription. */
   watchDeployment(deploymentId: string, watch: DeploymentWatch): () => void;
 }
