@@ -9,6 +9,7 @@ import { LiveFeed } from "./live.ts";
 
 // Printable ASCII, the shape of a UUID or similar client-generated token.
 const IDEMPOTENCY_KEY = /^[\x21-\x7e]{8,200}$/;
+const ACTIONS = ["stop", "start", "destroy"] as const;
 const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 const SSE_RETRY_MS = 2_000;
 const SSE_HEARTBEAT_MS = 20_000;
@@ -57,13 +58,14 @@ export function createApp({ control, webRoot, log }: AppDeps): Hono {
     }
   });
 
-  app.post("/api/containers/:id/:action{stop|start}", async (c) => {
+  app.post("/api/containers/:id/:action{stop|start|destroy}", async (c) => {
     const key = c.req.header("Idempotency-Key");
     if (!key || !IDEMPOTENCY_KEY.test(key)) {
       return c.json({ error: "Every write needs an Idempotency-Key header (8-200 printable characters)." }, 400);
     }
     const id = c.req.param("id");
-    const action = c.req.param("action") === "stop" ? "stop" : "start";
+    const action = ACTIONS.find((a) => a === c.req.param("action"));
+    if (!action) return c.json({ error: "Not found" }, 404);
     if (!UUID.test(id)) return c.json({ error: "No such container." }, 404);
     try {
       const result = await control.requestAction(id, action, key);

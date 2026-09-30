@@ -30,8 +30,8 @@ export type OperationView = { id: string; kind: OperationKind; status: Operation
 /** Whether an action can be requested right now, and if not, the message that says why. */
 export type Availability = { allowed: true } | { allowed: false; reason: string };
 
-/** The actions a user requests on an existing container (Destroy comes with its own ticket). */
-export type ContainerAction = "stop" | "start";
+/** The actions a user requests on an existing container. */
+export type ContainerAction = "stop" | "start" | "destroy";
 
 export type ContainerView = {
   id: string;
@@ -47,7 +47,8 @@ export type ContainerView = {
   actions: Record<ContainerAction, Availability>;
 };
 
-export type RequestResult = { operation: OperationView; container: ContainerView; replayed: boolean };
+/** `container` is null once the container is gone (a replayed Destroy). */
+export type RequestResult = { operation: OperationView; container: ContainerView | null; replayed: boolean };
 
 /** The idempotency key was already used for a different action. */
 export class IdempotencyKeyReused extends Error {}
@@ -107,6 +108,10 @@ export function deriveState(row: ContainerRow): ContainerState {
  */
 export function availability(row: ContainerRow, action: ContainerAction): Availability {
   const refuse = (reason: string): Availability => ({ allowed: false, reason });
+  // Destroy is the way out: it is accepted whatever else is happening, once.
+  if (action === "destroy") {
+    return isActive(row.op_status) && row.op_kind === "destroy" ? refuse("The container is already being destroyed.") : { allowed: true };
+  }
   if (isActive(row.op_status) && row.op_kind) return refuse(`Wait for ${LABEL[row.op_kind]} to finish.`);
   if (!row.service_id) return refuse("This container has no Railway service.");
   const running = row.observed_status === "SUCCESS" && row.observed_stopped === false;
@@ -127,7 +132,7 @@ function toView(row: ContainerRow): ContainerView {
     activeOperation:
       isActive(row.op_status) && row.op_id && row.op_kind && row.op_status ? { id: row.op_id, kind: row.op_kind, status: row.op_status } : null,
     lastError: row.op_status === "failed" && row.op_error ? { message: row.op_error, traceId: row.op_trace_id } : null,
-    actions: { stop: availability(row, "stop"), start: availability(row, "start") },
+    actions: { stop: availability(row, "stop"), start: availability(row, "start"), destroy: availability(row, "destroy") },
   };
 }
 
@@ -168,6 +173,8 @@ export class ContainerControl {
   readonly #listeners = new Set<ChangeListener>();
   readonly #observer: Observer;
   readonly #closing = new AbortController();
+  /** Per container, the drive in flight for it, so a Destroy can interrupt it and wait for it. */
+  readonly #drives = new Map<string, { done: Promise<void>; abort: AbortController }>();
 
   constructor(deps: ContainerControlDeps) {
     this.#deps = deps;
@@ -224,13 +231,13 @@ export class ContainerControl {
       throw error;
     }
     this.#publish(containerId);
-    this.#track(this.#driveCreate(operationId));
+    this.#trackDrive(containerId, (signal) => this.#driveCreate(operationId, signal));
     return this.#result(operationId, false);
   }
 
   /**
-   * Record a Stop or Start. The container row is locked first, so a concurrent
-   * request for the same container waits here and then sees this one as active.
+   * Record a Stop, Start or Destroy. The container row is locked first, so a
+   * concurrent request for the same container waits here and then sees this one as active.
    */
   async requestAction(containerId: string, action: ContainerAction, idempotencyKey: string): Promise<RequestResult> {
     const { db, clock } = this.#deps;
@@ -238,6 +245,9 @@ export class ContainerControl {
     const now = clock.now();
     try {
       await transaction(db, async (client) => {
+        // A replay first: the container may be gone because of this very request (a Destroy sent twice).
+        const seen = await client.query("SELECT 1 FROM operations WHERE idempotency_key = $1", [idempotencyKey]);
+        if ((seen.rowCount ?? 0) > 0) throw new Replay();
         const locked = await client.query("SELECT id FROM containers WHERE id = $1 AND destroyed_at IS NULL FOR UPDATE", [containerId]);
         if (locked.rowCount === 0) throw new ContainerNotFound();
         // Checked after the lock: a request with the same key that got there first has committed by now.
@@ -260,14 +270,15 @@ export class ContainerControl {
       });
     } catch (error) {
       if (error instanceof Replay) return this.#replay(idempotencyKey, action, containerId);
-      if (isUniqueViolation(error, "operations_one_active_per_container")) {
-        // Unreachable while the row lock above holds; the index is what guarantees it regardless.
-        throw new ActionRefused("Wait for the current operation to finish.");
-      }
+      // Unreachable while the row lock above holds; the indexes are what guarantee it regardless.
+      if (isUniqueViolation(error, "operations_one_active_per_container")) throw new ActionRefused("Wait for the current operation to finish.");
+      if (isUniqueViolation(error, "operations_one_active_destroy_per_container")) throw new ActionRefused("The container is already being destroyed.");
       throw error;
     }
     this.#publish(containerId);
-    this.#track(action === "stop" ? this.#driveStop(operationId) : this.#driveStart(operationId));
+    if (action === "destroy") this.#track(this.#driveDestroy(operationId, containerId));
+    else if (action === "stop") this.#trackDrive(containerId, () => this.#driveStop(operationId));
+    else this.#trackDrive(containerId, (signal) => this.#driveStart(operationId, signal));
     return this.#result(operationId, false);
   }
 
@@ -305,12 +316,13 @@ export class ContainerControl {
       "SELECT id, kind, status, container_id FROM operations WHERE id = $1",
       [operationId],
     );
-    const op = rows[0]!;
-    const containers = await this.#deps.db.query<ContainerRow>(`${CONTAINERS_SQL} AND c.id = $1`, [op.container_id]);
-    return { operation: { id: op.id, kind: op.kind, status: op.status }, container: toView(containers.rows[0]!), replayed };
+    const op = rows[0];
+    if (!op) throw new Error(`operation ${operationId} vanished`);
+    const container = await this.getContainer(op.container_id);
+    return { operation: { id: op.id, kind: op.kind, status: op.status }, container, replayed };
   }
 
-  async #driveCreate(operationId: string): Promise<void> {
+  async #driveCreate(operationId: string, signal: AbortSignal): Promise<void> {
     const { db, railway, clock } = this.#deps;
     const { rows } = await db.query<{ container_id: string; name: string }>(
       `UPDATE operations o SET status = 'in_progress', attempts = attempts + 1, updated_at = $2
@@ -323,7 +335,9 @@ export class ContainerControl {
 
     const created = await railway.createContainer({ name: op.name, image: CONTAINER_IMAGE });
     if (created.kind !== "ok") return this.#unsuccessful(operationId, op.container_id, created, "creating the service");
+    // Recorded even when a Destroy is waiting, so the Destroy knows which service to delete.
     await db.query("UPDATE containers SET service_id = $2 WHERE id = $1", [op.container_id, created.value.serviceId]);
+    if (signal.aborted) return;
 
     // The domain comes before observing, so a container is never shown running without its URL.
     const domain = await railway.createDomain(created.value.serviceId);
@@ -371,7 +385,7 @@ export class ContainerControl {
    * reports (Railway removes it) is stored as the container's state; a process that
    * dies here leaves it cleared, and the next boot's observer asks Railway for the latest.
    */
-  async #driveStart(operationId: string): Promise<void> {
+  async #driveStart(operationId: string, signal: AbortSignal): Promise<void> {
     const { db, railway, clock } = this.#deps;
     const op = await this.#begin(operationId, { clearDeployment: true });
     if (!op) return;
@@ -400,7 +414,7 @@ export class ContainerControl {
       await this.#unsuccessful(operationId, op.container_id, redeployed, "redeploying the service");
     }
 
-    const found = await this.#newDeployment(serviceId, op.deployment_id);
+    const found = await this.#newDeployment(serviceId, op.deployment_id, signal);
     if (found === "interrupted") return;
     if (found === null) {
       await restore();
@@ -424,7 +438,7 @@ export class ContainerControl {
    * The deployment a redeploy produced: the service's latest one once it is not the
    * one it replaced. Railway may list the old one for a moment, so it asks a few times.
    */
-  async #newDeployment(serviceId: string, replaced: string | null): Promise<DeploymentState | null | "interrupted"> {
+  async #newDeployment(serviceId: string, replaced: string | null, signal: AbortSignal): Promise<DeploymentState | null | "interrupted"> {
     const { railway, clock } = this.#deps;
     let backoff = LOOKUP_BACKOFF_MS;
     for (let attempt = 1; attempt <= NEW_DEPLOYMENT_LOOKUPS; attempt++) {
@@ -433,13 +447,50 @@ export class ContainerControl {
       if (outcome.kind === "rejected") return null;
       if (attempt === NEW_DEPLOYMENT_LOOKUPS) break;
       try {
-        await clock.sleep(outcome.kind === "rate_limited" ? outcome.retryAfterMs : backoff, this.#closing.signal);
+        await clock.sleep(outcome.kind === "rate_limited" ? outcome.retryAfterMs : backoff, signal);
       } catch {
         return "interrupted";
       }
       backoff = Math.min(backoff * 2, MAX_LOOKUP_BACKOFF_MS);
     }
     return null;
+  }
+
+  /**
+   * Destroy supersedes whatever else the container is doing. It interrupts and
+   * waits for the drive in flight first: a Create still waiting on serviceCreate
+   * would otherwise record a service after it was deleted, or leave one nobody tracks.
+   */
+  async #driveDestroy(operationId: string, containerId: string): Promise<void> {
+    const { db, railway, clock } = this.#deps;
+    const prior = this.#drives.get(containerId);
+    if (prior) {
+      prior.abort.abort();
+      await prior.done;
+    }
+    const op = await this.#begin(operationId);
+    if (!op) return;
+    await db.query(
+      `UPDATE operations SET status = 'failed', last_error = 'Superseded by Destroy.', updated_at = $2
+       WHERE container_id = $1 AND kind <> 'destroy' AND status IN ('pending', 'in_progress')`,
+      [containerId, clock.now()],
+    );
+    this.#observer.untrack(containerId);
+
+    // No service means Railway never confirmed one. After an ambiguous create one may still
+    // exist under the container's name; finding it is the name lookup's job (retries ticket).
+    if (op.service_id) {
+      const deleted = await railway.deleteService(op.service_id);
+      if (deleted.kind !== "ok") {
+        this.#observer.track(containerId);
+        return this.#unsuccessful(operationId, containerId, deleted, "deleting the service");
+      }
+    }
+    await transaction(db, async (client) => {
+      await client.query("UPDATE containers SET destroyed_at = $2 WHERE id = $1", [containerId, clock.now()]);
+      await client.query("UPDATE operations SET status = 'succeeded', updated_at = $2 WHERE id = $1", [operationId, clock.now()]);
+    });
+    this.#publish(containerId);
   }
 
   async #failAndPublish(operationId: string, containerId: string, message: string): Promise<void> {
@@ -519,11 +570,22 @@ export class ContainerControl {
     );
   }
 
-  #track(work: Promise<void>): void {
+  #track(work: Promise<void>): Promise<void> {
     const tracked = work.catch((error: unknown) => {
       (this.#deps.log ?? console.error)(`operation failed unexpectedly: ${error instanceof Error ? error.stack : String(error)}`);
     });
     this.#inFlight.add(tracked);
     void tracked.finally(() => this.#inFlight.delete(tracked));
+    return tracked;
+  }
+
+  /** Run a drive that a Destroy of the same container may interrupt (through `signal`) and wait for. */
+  #trackDrive(containerId: string, run: (signal: AbortSignal) => Promise<void>): void {
+    const abort = new AbortController();
+    const entry = { abort, done: this.#track(run(AbortSignal.any([abort.signal, this.#closing.signal]))) };
+    this.#drives.set(containerId, entry);
+    void entry.done.finally(() => {
+      if (this.#drives.get(containerId) === entry) this.#drives.delete(containerId);
+    });
   }
 }

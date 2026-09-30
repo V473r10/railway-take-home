@@ -1,11 +1,11 @@
 import { useEffect, useState } from "react";
 import { applyEvent, type Container, type ContainerAction, createContainer, requestAction, subscribeToContainers } from "./api.ts";
 
-const ACTION_LABEL: Record<ContainerAction, string> = { stop: "Stop", start: "Start" };
+const ACTION_LABEL: Record<ContainerAction, string> = { stop: "Stop", start: "Start", destroy: "Destroy" };
 
 /**
- * Stop and Start for one container. Availability comes from the server, so a
- * button is disabled for the same reason the API would refuse the click.
+ * Stop, Start and Destroy for one container. Availability comes from the server,
+ * so a button is disabled for the same reason the API would refuse the click.
  */
 function ContainerActions({ container, sending, onAction }: {
   container: Container;
@@ -13,7 +13,11 @@ function ContainerActions({ container, sending, onAction }: {
   onAction: (action: ContainerAction) => void;
 }) {
   const { stop, start } = container.actions;
-  // When nothing can be done, say why; disabled buttons cannot be focused to find out.
+  const onDestroy = () => {
+    // Destroy cannot be undone: the service and its deployments are deleted on Railway.
+    if (window.confirm(`Destroy ${container.name}? This deletes its Railway service and cannot be undone.`)) onAction("destroy");
+  };
+  // When neither Stop nor Start can be done, say why; disabled buttons cannot be focused to find out.
   const hint = !stop.allowed && !start.allowed ? start.reason : null;
   const hintId = `actions-hint-${container.id}`;
   return (
@@ -30,6 +34,16 @@ function ContainerActions({ container, sending, onAction }: {
           <span className="visually-hidden"> {container.name}</span>
         </button>
       ))}
+      <button
+        type="button"
+        className="danger"
+        onClick={onDestroy}
+        disabled={sending || !container.actions.destroy.allowed}
+        title={container.actions.destroy.allowed ? undefined : container.actions.destroy.reason}
+      >
+        Destroy
+        <span className="visually-hidden"> {container.name}</span>
+      </button>
       {hint && (
         <small id={hintId} className="hint">
           {hint}

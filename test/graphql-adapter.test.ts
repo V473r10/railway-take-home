@@ -215,3 +215,14 @@ describe("GraphqlRailway stop and start", () => {
     expect(await adapter.stopDeployment("dep-x")).toMatchObject({ kind: "rejected", message: "Deployment not found", traceId: "t-4" });
   });
 });
+
+describe("GraphqlRailway.deleteService", () => {
+  it("destroys with serviceDelete on the service id", async () => {
+    const { adapter, captured } = adapterReturning(() => json({ data: { serviceDelete: true } }));
+
+    expect(await adapter.deleteService("svc-5")).toEqual({ kind: "ok", value: undefined });
+    const body = JSON.parse(String(captured[0]?.init.body)) as { query: string; variables: unknown };
+    expect(body.query).toContain("serviceDelete(id:$id)");
+    expect(body.variables).toEqual({ id: "svc-5" });
+  });
+});
