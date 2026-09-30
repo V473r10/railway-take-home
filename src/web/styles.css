@@ -125,3 +125,27 @@ button.danger {
   background: color-mix(in srgb, var(--danger) 12%, transparent);
   color: var(--danger);
 }
+
+.login {
+  max-width: 22rem;
+}
+
+.login form {
+  display: flex;
+  flex-direction: column;
+  gap: 0.5rem;
+}
+
+.login input {
+  font: inherit;
+  padding: 0.45rem 0.6rem;
+  border-radius: 0.4rem;
+  border: 1px solid var(--line);
+  background: transparent;
+  color: inherit;
+}
+
+.login input:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 2px;
+}

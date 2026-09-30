@@ -1,14 +1,18 @@
-import { useEffect, useState } from "react";
+import { type FormEvent, useCallback, useEffect, useState } from "react";
 import {
   applyEvent,
   type Container,
   type ContainerAction,
   createContainer,
+  hasSession,
+  logIn,
+  NotLoggedIn,
   type ReadOnlyMode,
   requestAction,
   subscribeToContainers,
 } from "./api.ts";
 
+const RECHECK_MS = 2_000;
 const ACTION_LABEL: Record<ContainerAction, string> = { stop: "Stop", start: "Start", destroy: "Destroy" };
 const READ_ONLY_BANNER_ID = "read-only-banner";
 
@@ -64,7 +68,82 @@ function ContainerActions({ container, sending, readOnly, onAction }: {
   );
 }
 
+/** Asks for the shared password. A cost barrier in front of the app, not an account system. */
+function Login({ onLoggedIn }: { onLoggedIn: () => void }) {
+  const [password, setPassword] = useState("");
+  const [error, setError] = useState<string | null>(null);
+  const [sending, setSending] = useState(false);
+
+  const onSubmit = async (event: FormEvent<HTMLFormElement>) => {
+    event.preventDefault();
+    setSending(true);
+    try {
+      await logIn(password);
+      onLoggedIn();
+    } catch (e) {
+      setError(e instanceof Error ? e.message : String(e));
+      setSending(false);
+    }
+  };
+
+  return (
+    <main className="login">
+      <h1>Railway Container Control</h1>
+      <form onSubmit={(e) => void onSubmit(e)}>
+        <label htmlFor="password">Password</label>
+        <input
+          id="password"
+          type="password"
+          autoComplete="current-password"
+          required
+          autoFocus
+          value={password}
+          onChange={(e) => setPassword(e.target.value)}
+          aria-invalid={error !== null}
+          aria-describedby={error ? "login-error" : undefined}
+        />
+        <button type="submit" className="primary" disabled={sending}>
+          {sending ? "Checking…" : "Enter"}
+        </button>
+      </form>
+      {error && (
+        <p id="login-error" role="alert" className="error">
+          {error}
+        </p>
+      )}
+    </main>
+  );
+}
+
+/** Login screen until the server accepts the session cookie; the app after. The cookie survives reloads. */
 export function App() {
+  const [session, setSession] = useState<"checking" | "out" | "in">("checking");
+  // Bumped to reopen the live stream after it closed for a reason other than the session.
+  const [stream, setStream] = useState(0);
+
+  const check = useCallback((reopen: boolean) => {
+    const attempt = () =>
+      hasSession().then(
+        (ok) => {
+          setSession(ok ? "in" : "out");
+          if (ok && reopen) setStream((n) => n + 1);
+        },
+        // The server is unreachable; keep what is on screen and ask again shortly.
+        () => setTimeout(attempt, RECHECK_MS),
+      );
+    void attempt();
+  }, []);
+  useEffect(() => check(false), [check]);
+  // The live stream only closes for good when it was refused: ask whether the session is still valid.
+  const onStreamClosed = useCallback(() => check(true), [check]);
+  const onSessionEnded = useCallback(() => setSession("out"), []);
+
+  if (session === "checking") return <main aria-live="polite">Loading…</main>;
+  if (session === "out") return <Login onLoggedIn={() => setSession("in")} />;
+  return <Containers key={stream} onStreamClosed={onStreamClosed} onSessionEnded={onSessionEnded} />;
+}
+
+function Containers({ onStreamClosed, onSessionEnded }: { onStreamClosed: () => void; onSessionEnded: () => void }) {
   const [containers, setContainers] = useState<Container[] | null>(null);
   const [readOnly, setReadOnly] = useState<ReadOnlyMode | null>(null);
   const [connected, setConnected] = useState(true);
@@ -81,8 +160,9 @@ export function App() {
           setContainers((list) => applyEvent(list, event));
         },
         onConnection: setConnected,
+        onClosed: onStreamClosed,
       }),
-    [],
+    [onStreamClosed],
   );
 
   const onCreate = async () => {
@@ -95,6 +175,7 @@ export function App() {
       await createContainer(key);
       setError(null);
     } catch (e) {
+      if (e instanceof NotLoggedIn) return onSessionEnded();
       setError(e instanceof Error ? e.message : String(e));
     } finally {
       setCreating(false);
@@ -107,6 +188,7 @@ export function App() {
       await requestAction(containerId, action, crypto.randomUUID());
       setError(null);
     } catch (e) {
+      if (e instanceof NotLoggedIn) return onSessionEnded();
       setError(e instanceof Error ? e.message : String(e));
     } finally {
       setSending((ids) => {

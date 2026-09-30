@@ -4,6 +4,7 @@ import { createApp } from "./app.ts";
 import { systemClock } from "./clock.ts";
 import { ContainerControl } from "./containers.ts";
 import { connect, migrate } from "./db.ts";
+import type { GateConfig } from "./gate.ts";
 import type { RailwayAdapter } from "./railway/adapter.ts";
 import { FakeRailway } from "./railway/fake.ts";
 import { GraphqlRailway } from "./railway/graphql.ts";
@@ -12,6 +13,18 @@ function required(name: string): string {
   const value = process.env[name];
   if (!value) throw new Error(`Missing environment variable ${name}`);
   return value;
+}
+
+function gateFromEnv(): GateConfig {
+  const secret = required("SESSION_SECRET");
+  if (secret.length < 32) throw new Error("SESSION_SECRET must be at least 32 characters");
+  return {
+    password: required("APP_PASSWORD"),
+    secret,
+    // Railway serves the app over HTTPS; local development is plain http://127.0.0.1.
+    secureCookie: process.env.NODE_ENV === "production" || process.env.RAILWAY_ENVIRONMENT !== undefined,
+    clock: systemClock,
+  };
 }
 
 function railwayFromEnv(): RailwayAdapter {
@@ -28,11 +41,13 @@ function railwayFromEnv(): RailwayAdapter {
   });
 }
 
+// Read before touching the database, so a missing password stops the app at once.
+const gate = gateFromEnv();
 const db = connect(required("DATABASE_URL"));
 await migrate(db);
 const control = new ContainerControl({ db, railway: railwayFromEnv(), clock: systemClock });
 await control.start();
-const app = createApp({ control, webRoot: join(import.meta.dirname, "..", "..", "dist", "web") });
+const app = createApp({ control, gate, webRoot: join(import.meta.dirname, "..", "..", "dist", "web") });
 
 const port = Number(process.env.PORT ?? 3000);
 const server = serve({ fetch: app.fetch, port, hostname: process.env.HOST ?? "127.0.0.1" }, () =>
