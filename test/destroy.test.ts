@@ -97,7 +97,8 @@ describe("destroying a container", () => {
     const { id } = await running();
     h.railway.failNextOn("deleteService", { kind: "ambiguous_before_acting" });
     await action(h, id, "destroy");
-    await h.settled();
+    // The lost response is being retried, so the Destroy stays active while it backs off.
+    await eventually(() => h.clock.sleepers > 0);
 
     const res = await action(h, id, "destroy");
     expect(res.status).toBe(409);
@@ -108,7 +109,8 @@ describe("destroying a container", () => {
     const { id } = await running();
     h.railway.failNextOn("deleteService", { kind: "ambiguous_before_acting" });
     await action(h, id, "destroy");
-    await h.settled();
+    // The lost response is being retried, so the Destroy stays active while it backs off.
+    await eventually(() => h.clock.sleepers > 0);
 
     const [container] = await list(h);
     expect(container?.state).toBe("destroying");

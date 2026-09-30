@@ -21,7 +21,9 @@ export type InjectedFailure =
 
 export type FakeCall =
   | { method: "createContainer"; input: CreateContainerInput }
+  | { method: "findService"; name: string }
   | { method: "createDomain"; serviceId: string }
+  | { method: "serviceDomain"; serviceId: string }
   | { method: "latestDeployment"; serviceId: string }
   | { method: "readDeployment"; deploymentId: string }
   | { method: "watchDeployment"; deploymentId: string }
@@ -29,8 +31,8 @@ export type FakeCall =
   | { method: "redeployService"; serviceId: string }
   | { method: "deleteService"; serviceId: string };
 
-/** The calls that change something on Railway, and so can have failures injected. */
-export type FakeMutation = "createContainer" | "stopDeployment" | "redeployService" | "deleteService";
+/** The calls that can have failures injected: the ones that change something on Railway, and the name lookup. */
+export type FakeMutation = "createContainer" | "createDomain" | "stopDeployment" | "redeployService" | "deleteService" | "findService";
 
 export type FakeRailwayOptions = {
   /** Move every new deployment to SUCCESS after this long (local development only; tests move it by hand). */
@@ -203,12 +205,31 @@ export class FakeRailway implements RailwayAdapter {
     return { kind: "ok", value: undefined };
   }
 
+  async findService(name: string): Promise<Outcome<CreatedService | null>> {
+    this.calls.push({ method: "findService", name });
+    const early = failedBeforeActing(this.#failures.get("findService")?.shift());
+    if (early) return early;
+    const service = [...this.services.values()].find((s) => s.name === name);
+    return { kind: "ok", value: service ? { serviceId: service.id } : null };
+  }
+
   async createDomain(serviceId: string): Promise<Outcome<PublicDomain>> {
     this.calls.push({ method: "createDomain", serviceId });
+    const failure = this.#failures.get("createDomain")?.shift();
+    const early = failedBeforeActing(failure);
+    if (early) return early;
     const service = this.services.get(serviceId);
     if (!service) return notFound("Service not found");
     service.domain ??= `${service.name}.up.railway.app`;
+    if (failure?.kind === "ambiguous_after_acting") return { kind: "ambiguous", reason: "fake: response lost" };
     return { kind: "ok", value: { domain: service.domain } };
+  }
+
+  async serviceDomain(serviceId: string): Promise<Outcome<PublicDomain | null>> {
+    this.calls.push({ method: "serviceDomain", serviceId });
+    const service = this.services.get(serviceId);
+    if (!service) return notFound("Service not found");
+    return { kind: "ok", value: service.domain ? { domain: service.domain } : null };
   }
 
   async latestDeployment(serviceId: string): Promise<Outcome<DeploymentState | null>> {

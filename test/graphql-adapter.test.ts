@@ -226,3 +226,34 @@ describe("GraphqlRailway.deleteService", () => {
     expect(body.variables).toEqual({ id: "svc-5" });
   });
 });
+
+describe("GraphqlRailway lookups after an ambiguous call", () => {
+  it("finds a service by exact name among the sandbox project's services", async () => {
+    const { adapter, captured } = adapterReturning(() =>
+      json({
+        data: {
+          project: {
+            services: { edges: [{ node: { id: "svc-1", name: "rcc-op-10" } }, { node: { id: "svc-2", name: "rcc-op-1" } }] },
+          },
+        },
+      }),
+    );
+
+    expect(await adapter.findService("rcc-op-1")).toEqual({ kind: "ok", value: { serviceId: "svc-2" } });
+    expect(await adapter.findService("rcc-op-3")).toEqual({ kind: "ok", value: null });
+    const body = JSON.parse(String(captured[0]!.init.body)) as { query: string; variables: unknown };
+    expect(body.query).toContain("project(id:$id)");
+    expect(body.variables).toEqual({ id: "proj-1" });
+  });
+
+  it("reads the service's public domain, or null when it has none", async () => {
+    const { adapter, captured } = adapterReturning(() => json({ data: { domains: { serviceDomains: [{ domain: "x.up.railway.app" }] } } }));
+
+    expect(await adapter.serviceDomain("svc-9")).toEqual({ kind: "ok", value: { domain: "x.up.railway.app" } });
+    const body = JSON.parse(String(captured[0]!.init.body)) as { variables: unknown };
+    expect(body.variables).toEqual({ p: "proj-1", e: "env-1", s: "svc-9" });
+
+    const empty = adapterReturning(() => json({ data: { domains: { serviceDomains: [] } } }));
+    expect(await empty.adapter.serviceDomain("svc-9")).toEqual({ kind: "ok", value: null });
+  });
+});
