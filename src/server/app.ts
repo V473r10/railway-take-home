@@ -5,6 +5,7 @@ import { serveStatic } from "@hono/node-server/serve-static";
 import { Hono } from "hono";
 import { streamSSE } from "hono/streaming";
 import { ActionRefused, ContainerNotFound, type ContainerControl, IdempotencyKeyReused, ReadOnlyRefused } from "./containers.ts";
+import { type GateConfig, mountPasswordGate } from "./gate.ts";
 import { LiveFeed } from "./live.ts";
 
 // Printable ASCII, the shape of a UUID or similar client-generated token.
@@ -14,12 +15,15 @@ const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 const SSE_RETRY_MS = 2_000;
 const SSE_HEARTBEAT_MS = 20_000;
 
-export type AppDeps = { control: ContainerControl; webRoot?: string; log?: (msg: string) => void };
+export type AppDeps = { control: ContainerControl; gate: GateConfig; webRoot?: string; log?: (msg: string) => void };
 
 /** The HTTP API, which is also the one seam every test enters through. */
-export function createApp({ control, webRoot, log }: AppDeps): Hono {
+export function createApp({ control, gate, webRoot, log }: AppDeps): Hono {
   const app = new Hono();
   const feed = new LiveFeed(control, log);
+
+  // Before every other route. The static UI below stays open so the login screen can render.
+  mountPasswordGate(app, gate);
 
   app.get("/api/health", (c) => c.json({ ok: true }));
 

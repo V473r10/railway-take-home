@@ -12,13 +12,21 @@ import { type FakeCall, type FakeMutation, FakeRailway } from "../src/server/rai
 
 const ADMIN_URL = process.env.TEST_DATABASE_URL ?? "postgres://postgres@127.0.0.1:54329/postgres";
 
+/** The shared password and signing secret every harness app is started with. */
+export const TEST_PASSWORD = "correct horse battery staple";
+export const TEST_SESSION_SECRET = "test-session-secret-at-least-32-characters";
+
 export type Harness = {
   railway: FakeRailway;
   clock: ManualClock;
   /** The app's database, for the few tests that check a guarantee the schema itself must give. */
   db: Db;
-  /** Send a request to the app, as a browser would. */
+  /** Send a request to the app, as a browser would after logging in. */
   request: (path: string, init?: RequestInit) => Promise<Response>;
+  /** Send a request with no session cookie (or only the cookies given), as a stranger would. */
+  anonymous: (path: string, init?: RequestInit) => Promise<Response>;
+  /** The session cookie the harness logged in with, as a `Cookie` header value. */
+  sessionCookie: string;
   /** Wait until every operation started so far has stopped making progress. */
   settled: () => Promise<void>;
   /** Open the SSE stream, as a browser tab would. */
@@ -53,6 +61,7 @@ export async function startHarness(): Promise<Harness> {
   const clock = new ManualClock();
   const log = () => {};
   const pools: Db[] = [];
+  const gate = { password: TEST_PASSWORD, secret: TEST_SESSION_SECRET, secureCookie: false, clock };
 
   // One backend process: its own pool and its own line to Railway, over the shared database and fake.
   const boot = async () => {
@@ -65,7 +74,7 @@ export async function startHarness(): Promise<Harness> {
     // The identity check at boot is not something a test's own requests caused.
     const identity = railway.calls.findIndex((c) => c.method === "verifyIdentity");
     if (identity !== -1) railway.calls.splice(identity, 1);
-    return { db, line, control, app: createApp({ control, log }) };
+    return { db, line, control, app: createApp({ control, gate, log }) };
   };
   let current = await boot();
   const streams = new Set<EventStream>();
@@ -74,16 +83,32 @@ export async function startHarness(): Promise<Harness> {
     streams.clear();
   };
 
+  // Log in through the real route, so every other test runs behind the gate.
+  const login = await current.app.request("/api/session", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ password: TEST_PASSWORD }),
+  });
+  const sessionCookie = login.headers.get("set-cookie")?.split(";")[0];
+  if (login.status !== 200 || !sessionCookie) throw new Error(`harness login failed: HTTP ${login.status}`);
+  const withSession = (init?: RequestInit): RequestInit => {
+    const headers = new Headers(init?.headers);
+    if (!headers.has("Cookie")) headers.set("Cookie", sessionCookie);
+    return { ...init, headers };
+  };
+
   return {
     railway,
     clock,
     get db() {
       return current.db;
     },
-    request: async (path, init) => current.app.request(path, init),
+    request: async (path, init) => current.app.request(path, withSession(init)),
+    anonymous: async (path, init) => current.app.request(path, init),
+    sessionCookie,
     settled: () => current.control.settled(),
     events: async () => {
-      const stream = await openEventStream(await current.app.request("/api/events"));
+      const stream = await openEventStream(await current.app.request("/api/events", withSession()));
       streams.add(stream);
       return stream;
     },
