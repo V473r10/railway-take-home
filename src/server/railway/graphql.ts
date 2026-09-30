@@ -7,6 +7,7 @@ import {
   type Outcome,
   type PublicDomain,
   type RailwayAdapter,
+  type TokenIdentity,
 } from "./adapter.ts";
 
 export const RAILWAY_ENDPOINT = "https://backboard.railway.com/graphql/v2";
@@ -59,6 +60,15 @@ export class GraphqlRailway implements RailwayAdapter {
 
   constructor(config: GraphqlRailwayConfig) {
     this.#config = config;
+  }
+
+  async verifyIdentity(): Promise<Outcome<TokenIdentity>> {
+    // An anonymous caller gets `errors[]` or a null `me`; both leave the token unconfirmed (M0 spike).
+    const outcome = await this.#request<{ me: { name: string | null } | null } | null>("query{ me{ name } }", {});
+    if (outcome.kind !== "ok") return outcome;
+    const me = outcome.value?.me;
+    if (!me) return { kind: "rejected", message: "Railway did not say who the token belongs to", code: null, traceId: null };
+    return { kind: "ok", value: { name: me.name ?? "(unnamed)" } };
   }
 
   async createContainer(input: CreateContainerInput): Promise<Outcome<CreatedService>> {

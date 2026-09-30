@@ -1,15 +1,25 @@
 import { useEffect, useState } from "react";
-import { applyEvent, type Container, type ContainerAction, createContainer, requestAction, subscribeToContainers } from "./api.ts";
+import {
+  applyEvent,
+  type Container,
+  type ContainerAction,
+  createContainer,
+  type ReadOnlyMode,
+  requestAction,
+  subscribeToContainers,
+} from "./api.ts";
 
 const ACTION_LABEL: Record<ContainerAction, string> = { stop: "Stop", start: "Start", destroy: "Destroy" };
+const READ_ONLY_BANNER_ID = "read-only-banner";
 
 /**
  * Stop, Start and Destroy for one container. Availability comes from the server,
  * so a button is disabled for the same reason the API would refuse the click.
  */
-function ContainerActions({ container, sending, onAction }: {
+function ContainerActions({ container, sending, readOnly, onAction }: {
   container: Container;
   sending: boolean;
+  readOnly: boolean;
   onAction: (action: ContainerAction) => void;
 }) {
   const { stop, start } = container.actions;
@@ -18,7 +28,8 @@ function ContainerActions({ container, sending, onAction }: {
     if (window.confirm(`Destroy ${container.name}? This deletes its Railway service and cannot be undone.`)) onAction("destroy");
   };
   // When neither Stop nor Start can be done, say why; disabled buttons cannot be focused to find out.
-  const hint = !stop.allowed && !start.allowed ? start.reason : null;
+  // In read-only mode the banner already says why, once for the whole page.
+  const hint = readOnly ? "Read-only mode, see the banner above." : !stop.allowed && !start.allowed ? start.reason : null;
   const hintId = `actions-hint-${container.id}`;
   return (
     <div className="row-actions">
@@ -55,6 +66,7 @@ function ContainerActions({ container, sending, onAction }: {
 
 export function App() {
   const [containers, setContainers] = useState<Container[] | null>(null);
+  const [readOnly, setReadOnly] = useState<ReadOnlyMode | null>(null);
   const [connected, setConnected] = useState(true);
   const [error, setError] = useState<string | null>(null);
   const [creating, setCreating] = useState(false);
@@ -64,7 +76,10 @@ export function App() {
   useEffect(
     () =>
       subscribeToContainers({
-        onEvent: (event) => setContainers((list) => applyEvent(list, event)),
+        onEvent: (event) => {
+          if (event.type === "snapshot") setReadOnly(event.readOnly);
+          setContainers((list) => applyEvent(list, event));
+        },
         onConnection: setConnected,
       }),
     [],
@@ -107,11 +122,23 @@ export function App() {
       <header>
         <h1>Railway Container Control</h1>
         <div className="actions">
-          <button type="button" className="primary" onClick={() => void onCreate()} disabled={creating}>
+          <button
+            type="button"
+            className="primary"
+            onClick={() => void onCreate()}
+            disabled={creating || readOnly !== null}
+            aria-describedby={readOnly ? READ_ONLY_BANNER_ID : undefined}
+          >
             {creating ? "Creating…" : "Create container"}
           </button>
         </div>
       </header>
+
+      {readOnly && (
+        <p id={READ_ONLY_BANNER_ID} role="alert" className="banner-read-only">
+          {readOnly.reason}
+        </p>
+      )}
 
       {!connected && (
         <p role="status" className="notice">
@@ -170,7 +197,12 @@ export function App() {
                   <time dateTime={c.createdAt}>{new Date(c.createdAt).toLocaleTimeString()}</time>
                 </td>
                 <td>
-                  <ContainerActions container={c} sending={sending.has(c.id)} onAction={(action) => void onAction(c.id, action)} />
+                  <ContainerActions
+                    container={c}
+                    sending={sending.has(c.id)}
+                    readOnly={readOnly !== null}
+                    onAction={(action) => void onAction(c.id, action)}
+                  />
                 </td>
               </tr>
             ))}

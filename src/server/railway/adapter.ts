@@ -29,6 +29,9 @@ export type PublicDomain = { domain: string };
  */
 export type DeploymentState = { deploymentId: string; status: string; stopped: boolean };
 
+/** Who Railway says the token belongs to. */
+export type TokenIdentity = { name: string };
+
 export type DeploymentWatch = {
   /** A change pushed by Railway. Never the current state on subscribe: read that separately. */
   onState: (state: DeploymentState) => void;
@@ -37,6 +40,11 @@ export type DeploymentWatch = {
 };
 
 export interface RailwayAdapter {
+  /**
+   * Who the token belongs to. Railway does not reject an invalid token, it treats
+   * the caller as anonymous, so anything but `ok` means the token is unconfirmed (ADR 0003).
+   */
+  verifyIdentity(): Promise<Outcome<TokenIdentity>>;
   createContainer(input: CreateContainerInput): Promise<Outcome<CreatedService>>;
   /** The service with this name in the sandbox project, or null. How an ambiguous create is resolved (ADR 0004). */
   findService(name: string): Promise<Outcome<CreatedService | null>>;

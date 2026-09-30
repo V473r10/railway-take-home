@@ -6,6 +6,7 @@ import type {
   Outcome,
   PublicDomain,
   RailwayAdapter,
+  TokenIdentity,
 } from "./adapter.ts";
 
 export type FakeService = { id: string; name: string; image: string; domain: string | null; deploymentId: string };
@@ -20,6 +21,7 @@ export type InjectedFailure =
   | { kind: "ambiguous_before_acting" };
 
 export type FakeCall =
+  | { method: "verifyIdentity" }
   | { method: "createContainer"; input: CreateContainerInput }
   | { method: "findService"; name: string }
   | { method: "createDomain"; serviceId: string }
@@ -31,8 +33,15 @@ export type FakeCall =
   | { method: "redeployService"; serviceId: string }
   | { method: "deleteService"; serviceId: string };
 
-/** The calls that can have failures injected: the ones that change something on Railway, and the name lookup. */
-export type FakeMutation = "createContainer" | "createDomain" | "stopDeployment" | "redeployService" | "deleteService" | "findService";
+/** The calls that can have failures injected: the ones that change something on Railway, the name lookup and the identity check. */
+export type FakeMutation =
+  | "createContainer"
+  | "createDomain"
+  | "stopDeployment"
+  | "redeployService"
+  | "deleteService"
+  | "findService"
+  | "verifyIdentity";
 
 export type FakeRailwayOptions = {
   /** Move every new deployment to SUCCESS after this long (local development only; tests move it by hand). */
@@ -130,6 +139,13 @@ export class FakeRailway implements RailwayAdapter {
         // Deleted in the meantime.
       }
     }, ms).unref();
+  }
+
+  async verifyIdentity(): Promise<Outcome<TokenIdentity>> {
+    this.calls.push({ method: "verifyIdentity" });
+    const early = failedBeforeActing(this.#failures.get("verifyIdentity")?.shift());
+    if (early) return early;
+    return { kind: "ok", value: { name: "fake-user" } };
   }
 
   async createContainer(input: CreateContainerInput): Promise<Outcome<CreatedService>> {

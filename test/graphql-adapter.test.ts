@@ -82,6 +82,36 @@ describe("GraphqlRailway.createContainer", () => {
   });
 });
 
+describe("GraphqlRailway.verifyIdentity", () => {
+  it("asks `me` who the token belongs to, with the token as a bearer", async () => {
+    const { adapter, captured } = adapterReturning(() => json({ data: { me: { name: "Facundo" } } }));
+
+    expect(await adapter.verifyIdentity()).toEqual({ kind: "ok", value: { name: "Facundo" } });
+    const [call] = captured;
+    expect(call!.url).toBe("https://backboard.railway.com/graphql/v2");
+    expect(new Headers(call!.init.headers).get("Authorization")).toBe("Bearer tok-secret");
+    const body = JSON.parse(String(call!.init.body)) as { query: string; variables: unknown };
+    expect(body.query).toBe("query{ me{ name } }");
+    expect(body.variables).toEqual({});
+  });
+
+  it.each([{ data: { me: null } }, { data: null }])("treats %j, an anonymous answer, as unconfirmed", async (answer) => {
+    const { adapter } = adapterReturning(() => json(answer));
+
+    expect(await adapter.verifyIdentity()).toMatchObject({ kind: "rejected", message: "Railway did not say who the token belongs to" });
+  });
+
+  it("passes errors[] and a missing answer through as they are", async () => {
+    const refused = adapterReturning(() => json({ data: null, errors: [{ message: "Not Authorized" }] }));
+    expect(await refused.adapter.verifyIdentity()).toMatchObject({ kind: "rejected", message: "Not Authorized" });
+
+    const silent = adapterReturning(() => {
+      throw new TypeError("fetch failed");
+    });
+    expect(await silent.adapter.verifyIdentity()).toEqual({ kind: "ambiguous", reason: "fetch failed" });
+  });
+});
+
 describe("GraphqlRailway deployments and domains", () => {
   it("creates the public domain on the image's port", async () => {
     const { adapter, captured } = adapterReturning(() => json({ data: { serviceDomainCreate: { domain: "x.up.railway.app" } } }));
