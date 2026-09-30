@@ -112,3 +112,8 @@ th {
   flex-basis: 100%;
   color: var(--muted);
 }
+
+button.danger {
+  border-color: var(--danger);
+  color: var(--danger);
+}

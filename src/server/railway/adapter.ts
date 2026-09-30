@@ -50,6 +50,8 @@ export interface RailwayAdapter {
    * deployment: find that with `latestDeployment` (M0 spike).
    */
   redeployService(serviceId: string): Promise<Outcome<void>>;
+  /** Delete the service and everything it runs (M0 spike). */
+  deleteService(serviceId: string): Promise<Outcome<void>>;
   /** Subscribe to changes of one deployment. Returns the function that ends the subscription. */
   watchDeployment(deploymentId: string, watch: DeploymentWatch): () => void;
 }

@@ -13,7 +13,7 @@ export type ContainerState =
 
 export type Availability = { allowed: true } | { allowed: false; reason: string };
 
-export type ContainerAction = "stop" | "start";
+export type ContainerAction = "stop" | "start" | "destroy";
 
 export type Container = {
   id: string;
@@ -67,7 +67,7 @@ export async function createContainer(idempotencyKey: string): Promise<void> {
   if (!res.ok) throw new Error(await readError(res));
 }
 
-/** Stop or Start a container. Like Create, one key per click. */
+/** Stop, Start or Destroy a container. Like Create, one key per click. */
 export async function requestAction(containerId: string, action: ContainerAction, idempotencyKey: string): Promise<void> {
   const res = await fetch(`/api/containers/${encodeURIComponent(containerId)}/${action}`, {
     method: "POST",

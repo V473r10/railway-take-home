@@ -26,10 +26,11 @@ export type FakeCall =
   | { method: "readDeployment"; deploymentId: string }
   | { method: "watchDeployment"; deploymentId: string }
   | { method: "stopDeployment"; deploymentId: string }
-  | { method: "redeployService"; serviceId: string };
+  | { method: "redeployService"; serviceId: string }
+  | { method: "deleteService"; serviceId: string };
 
 /** The calls that change something on Railway, and so can have failures injected. */
-export type FakeMutation = "createContainer" | "stopDeployment" | "redeployService";
+export type FakeMutation = "createContainer" | "stopDeployment" | "redeployService" | "deleteService";
 
 export type FakeRailwayOptions = {
   /** Move every new deployment to SUCCESS after this long (local development only; tests move it by hand). */
@@ -117,6 +118,18 @@ export class FakeRailway implements RailwayAdapter {
     for (const w of this.#watches.get(state.deploymentId) ?? []) w.onState({ ...state });
   }
 
+  /** Local development only: move a deployment on its own later, unless its service is gone by then. */
+  #later(move: () => void): void {
+    const ms = this.#options.autoSucceedAfterMs ?? 0;
+    setTimeout(() => {
+      try {
+        move();
+      } catch {
+        // Deleted in the meantime.
+      }
+    }, ms).unref();
+  }
+
   async createContainer(input: CreateContainerInput): Promise<Outcome<CreatedService>> {
     this.calls.push({ method: "createContainer", input });
     if (this.#gate) await this.#gate;
@@ -130,7 +143,7 @@ export class FakeRailway implements RailwayAdapter {
     this.services.set(service.id, service);
     this.deployments.set(service.deploymentId, { deploymentId: service.deploymentId, status: "DEPLOYING", stopped: false });
     if (this.#options.autoSucceedAfterMs !== undefined) {
-      setTimeout(() => this.setDeployment(service.id, "SUCCESS"), this.#options.autoSucceedAfterMs).unref();
+      this.#later(() => this.setDeployment(service.id, "SUCCESS"));
     }
     if (failure?.kind === "ambiguous_after_acting") return { kind: "ambiguous", reason: "fake: response lost" };
     return { kind: "ok", value: { serviceId: service.id } };
@@ -146,7 +159,7 @@ export class FakeRailway implements RailwayAdapter {
     // Railway takes a moment to stop it; tests move it with setDeployment(..., "SUCCESS", true).
     if (this.#options.autoSucceedAfterMs !== undefined) {
       const service = [...this.services.values()].find((s) => s.deploymentId === deploymentId);
-      if (service) setTimeout(() => this.setDeployment(service.id, "SUCCESS", true), this.#options.autoSucceedAfterMs).unref();
+      if (service) this.#later(() => this.setDeployment(service.id, "SUCCESS", true));
     }
     if (failure?.kind === "ambiguous_after_acting") return { kind: "ambiguous", reason: "fake: response lost" };
     return { kind: "ok", value: undefined };
@@ -169,8 +182,23 @@ export class FakeRailway implements RailwayAdapter {
     for (const w of this.#watches.get(replaced) ?? []) w.onState({ ...removed });
     this.#replaced.set(serviceId, replaced);
     if (this.#options.autoSucceedAfterMs !== undefined) {
-      setTimeout(() => this.setDeployment(service.id, "SUCCESS"), this.#options.autoSucceedAfterMs).unref();
+      this.#later(() => this.setDeployment(service.id, "SUCCESS"));
     }
+    if (failure?.kind === "ambiguous_after_acting") return { kind: "ambiguous", reason: "fake: response lost" };
+    return { kind: "ok", value: undefined };
+  }
+
+  async deleteService(serviceId: string): Promise<Outcome<void>> {
+    this.calls.push({ method: "deleteService", serviceId });
+    const failure = this.#failures.get("deleteService")?.shift();
+    const early = failedBeforeActing(failure);
+    if (early) return early;
+    const service = this.services.get(serviceId);
+    if (!service) return notFound("Service not found");
+    this.services.delete(serviceId);
+    const removed: DeploymentState = { deploymentId: service.deploymentId, status: "REMOVED", stopped: false };
+    this.deployments.set(removed.deploymentId, removed);
+    for (const w of this.#watches.get(removed.deploymentId) ?? []) w.onState({ ...removed });
     if (failure?.kind === "ambiguous_after_acting") return { kind: "ambiguous", reason: "fake: response lost" };
     return { kind: "ok", value: undefined };
   }

@@ -119,6 +119,11 @@ export class GraphqlRailway implements RailwayAdapter {
     return mapOk(outcome, () => undefined);
   }
 
+  async deleteService(serviceId: string): Promise<Outcome<void>> {
+    const outcome = await this.#request<{ serviceDelete: boolean }>("mutation($id:String!){ serviceDelete(id:$id) }", { id: serviceId });
+    return mapOk(outcome, () => undefined);
+  }
+
   /**
    * One graphql-transport-ws socket per subscription (at most one per container).
    * Auth goes in `connection_init.payload`, not in a header (M0 spike). Railway

@@ -79,7 +79,7 @@ export type ContainerBody = {
   serviceId: string | null;
   url: string | null;
   lastError: { message: string; traceId: string | null } | null;
-  actions: Record<"stop" | "start", { allowed: true } | { allowed: false; reason: string }>;
+  actions: Record<"stop" | "start" | "destroy", { allowed: true } | { allowed: false; reason: string }>;
 };
 
 export type CreateBody = { operation: { id: string; kind: string; status: string }; container: ContainerBody };
@@ -88,7 +88,7 @@ export function create(h: Harness, idempotencyKey: string = randomUUID()): Promi
   return h.request("/api/containers", { method: "POST", headers: { "Idempotency-Key": idempotencyKey } });
 }
 
-export function action(h: Harness, containerId: string, kind: "stop" | "start", idempotencyKey: string = randomUUID()): Promise<Response> {
+export function action(h: Harness, containerId: string, kind: "stop" | "start" | "destroy", idempotencyKey: string = randomUUID()): Promise<Response> {
   return h.request(`/api/containers/${containerId}/${kind}`, { method: "POST", headers: { "Idempotency-Key": idempotencyKey } });
 }
 
