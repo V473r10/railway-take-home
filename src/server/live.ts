@@ -1,8 +1,8 @@
-import type { ContainerControl, ContainerView, ReadOnlyMode } from "./containers.ts";
+import { CONTAINER_LIMIT, type ContainerControl, type ContainerView, type ReadOnlyMode } from "./containers.ts";
 
 export type LiveEvent =
-  /** The whole list, sent once when a client connects (or reconnects), with the app's read-only mode. */
-  | { type: "snapshot"; containers: ContainerView[]; readOnly: ReadOnlyMode | null }
+  /** The whole list, sent once when a client connects (or reconnects), with the app's read-only mode and container limit. */
+  | { type: "snapshot"; containers: ContainerView[]; readOnly: ReadOnlyMode | null; containerLimit: number }
   | { type: "upsert"; container: ContainerView }
   | { type: "remove"; id: string };
 
@@ -37,7 +37,12 @@ export class LiveFeed {
     const client: Client = { send, open: true };
     this.#enqueue(async () => {
       if (!client.open) return;
-      client.send({ type: "snapshot", containers: await this.#control.listContainers(), readOnly: this.#control.readOnly });
+      client.send({
+        type: "snapshot",
+        containers: await this.#control.listContainers(),
+        readOnly: this.#control.readOnly,
+        containerLimit: CONTAINER_LIMIT,
+      });
       this.#clients.add(client);
     });
     return () => {

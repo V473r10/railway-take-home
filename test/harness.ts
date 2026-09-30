@@ -4,7 +4,7 @@
 import { randomUUID } from "node:crypto";
 import pg from "pg";
 import { createApp } from "../src/server/app.ts";
-import { ManualClock } from "../src/server/clock.ts";
+import { type Clock, ManualClock } from "../src/server/clock.ts";
 import { ContainerControl } from "../src/server/containers.ts";
 import { connect, type Db, migrate } from "../src/server/db.ts";
 import type { CreateContainerInput, DeploymentWatch, RailwayAdapter } from "../src/server/railway/adapter.ts";
@@ -69,7 +69,15 @@ export async function startHarness(): Promise<Harness> {
     pools.push(db);
     await migrate(db);
     const line = new ProcessRailway(railway);
-    const control = new ContainerControl({ db, railway: line, clock, log });
+    // A killed process runs no periodic job (the lifetime sweep) either.
+    const alive = new AbortController();
+    const processClock: Clock = {
+      now: () => clock.now(),
+      sleep: (ms, signal) => clock.sleep(ms, signal),
+      every: (ms, run, signal) => clock.every(ms, run, AbortSignal.any([signal, alive.signal])),
+    };
+    line.onKill(() => alive.abort());
+    const control = new ContainerControl({ db, railway: line, clock: processClock, log });
     await control.start();
     // The identity check at boot is not something a test's own requests caused.
     const identity = railway.calls.findIndex((c) => c.method === "verifyIdentity");
@@ -148,6 +156,7 @@ class ProcessRailway implements RailwayAdapter {
   readonly #subscriptions = new Set<() => void>();
   #death: { method: FakeMutation; when: DeathPoint } | null = null;
   #dead = false;
+  #onKill: Array<() => void> = [];
 
   constructor(railway: FakeRailway) {
     this.#railway = railway;
@@ -165,6 +174,12 @@ class ProcessRailway implements RailwayAdapter {
     this.#dead = true;
     for (const unsubscribe of this.#subscriptions) unsubscribe();
     this.#subscriptions.clear();
+    for (const listener of this.#onKill) listener();
+    this.#onKill = [];
+  }
+
+  onKill(listener: () => void): void {
+    this.#onKill.push(listener);
   }
 
   async #forward<T>(method: FakeCall["method"], call: () => Promise<T>): Promise<T> {
@@ -232,6 +247,8 @@ export type ContainerBody = {
   state: string;
   serviceId: string | null;
   url: string | null;
+  createdAt: string;
+  expiresAt: string;
   lastError: { message: string; traceId: string | null } | null;
   actions: Record<"stop" | "start" | "destroy", { allowed: true } | { allowed: false; reason: string }>;
 };
