@@ -27,6 +27,12 @@ export type ContainerState =
 
 export type OperationView = { id: string; kind: OperationKind; status: OperationStatus };
 
+/** Whether an action can be requested right now, and if not, the message that says why. */
+export type Availability = { allowed: true } | { allowed: false; reason: string };
+
+/** The actions a user requests on an existing container (Destroy comes with its own ticket). */
+export type ContainerAction = "stop" | "start";
+
 export type ContainerView = {
   id: string;
   name: string;
@@ -37,6 +43,8 @@ export type ContainerView = {
   createdAt: string;
   activeOperation: OperationView | null;
   lastError: { message: string; traceId: string | null } | null;
+  /** Computed by the same rule that refuses a request, so the UI and the API cannot disagree. */
+  actions: Record<ContainerAction, Availability>;
 };
 
 export type RequestResult = { operation: OperationView; container: ContainerView; replayed: boolean };
@@ -44,12 +52,25 @@ export type RequestResult = { operation: OperationView; container: ContainerView
 /** The idempotency key was already used for a different action. */
 export class IdempotencyKeyReused extends Error {}
 
+/** No such container, or it is gone. */
+export class ContainerNotFound extends Error {}
+
+/** The action cannot be requested in the container's current state; the message is shown to the user. */
+export class ActionRefused extends Error {}
+
 const TRANSITIONAL: Record<OperationKind, ContainerState> = {
   create: "creating",
   start: "starting",
   stop: "stopping",
   destroy: "destroying",
 };
+
+const LABEL: Record<OperationKind, string> = { create: "Create", start: "Start", stop: "Stop", destroy: "Destroy" };
+
+/** How many times a Start looks for the deployment its redeploy produced before giving up. */
+export const NEW_DEPLOYMENT_LOOKUPS = 8;
+const LOOKUP_BACKOFF_MS = 1_000;
+const MAX_LOOKUP_BACKOFF_MS = 30_000;
 
 type ContainerRow = {
   id: string;
@@ -66,18 +87,36 @@ type ContainerRow = {
   op_trace_id: string | null;
 };
 
+function isActive(status: OperationStatus | null): boolean {
+  return status === "pending" || status === "in_progress";
+}
+
 /** Container state as the user sees it: an active operation first, then the last failure, then what Railway reported. */
 export function deriveState(row: ContainerRow): ContainerState {
-  const active = row.op_status === "pending" || row.op_status === "in_progress";
-  if (active && row.op_kind) return TRANSITIONAL[row.op_kind];
+  if (isActive(row.op_status) && row.op_kind) return TRANSITIONAL[row.op_kind];
   if (row.op_status === "failed") return "failed";
   if (row.observed_status === "SUCCESS") return row.observed_stopped ? "stopped" : "running";
   if (row.observed_status === "CRASHED") return "crashed";
   return "creating";
 }
 
+/**
+ * Whether Stop or Start can be requested. Decided from what Railway last reported,
+ * not from the derived state: a failed Start leaves a stopped container that can be
+ * started again. The database's one-active-operation index backs the first rule.
+ */
+export function availability(row: ContainerRow, action: ContainerAction): Availability {
+  const refuse = (reason: string): Availability => ({ allowed: false, reason });
+  if (isActive(row.op_status) && row.op_kind) return refuse(`Wait for ${LABEL[row.op_kind]} to finish.`);
+  if (!row.service_id) return refuse("This container has no Railway service.");
+  const running = row.observed_status === "SUCCESS" && row.observed_stopped === false;
+  if (action === "stop") return running ? { allowed: true } : refuse("Only a running container can be stopped.");
+  if (running) return refuse("The container is already running.");
+  if (row.observed_status === null) return refuse("Railway has not reported this container's deployment yet.");
+  return { allowed: true };
+}
+
 function toView(row: ContainerRow): ContainerView {
-  const active = row.op_status === "pending" || row.op_status === "in_progress";
   return {
     id: row.id,
     name: row.name,
@@ -85,8 +124,10 @@ function toView(row: ContainerRow): ContainerView {
     serviceId: row.service_id,
     url: row.domain ? `https://${row.domain}` : null,
     createdAt: row.created_at.toISOString(),
-    activeOperation: active && row.op_id && row.op_kind && row.op_status ? { id: row.op_id, kind: row.op_kind, status: row.op_status } : null,
+    activeOperation:
+      isActive(row.op_status) && row.op_id && row.op_kind && row.op_status ? { id: row.op_id, kind: row.op_kind, status: row.op_status } : null,
     lastError: row.op_status === "failed" && row.op_error ? { message: row.op_error, traceId: row.op_trace_id } : null,
+    actions: { stop: availability(row, "stop"), start: availability(row, "start") },
   };
 }
 
@@ -96,11 +137,21 @@ const CONTAINERS_SQL = `
          o.id AS op_id, o.kind AS op_kind, o.status AS op_status, o.last_error AS op_error, o.last_trace_id AS op_trace_id
   FROM containers c
   LEFT JOIN LATERAL (
-    SELECT * FROM operations WHERE container_id = c.id ORDER BY created_at DESC, id DESC LIMIT 1
+    SELECT * FROM operations WHERE container_id = c.id ORDER BY seq DESC LIMIT 1
   ) o ON true
   WHERE c.destroyed_at IS NULL`;
 
 class Replay extends Error {}
+
+/** A Postgres unique violation of one named constraint or index. */
+function isUniqueViolation(error: unknown, constraint: string): boolean {
+  return (
+    typeof error === "object" &&
+    error !== null &&
+    (error as { code?: unknown }).code === "23505" &&
+    (error as { constraint?: unknown }).constraint === constraint
+  );
+}
 
 export type ContainerControlDeps = { db: Db; railway: RailwayAdapter; clock: Clock; log?: (msg: string) => void };
 
@@ -116,6 +167,7 @@ export class ContainerControl {
   readonly #inFlight = new Set<Promise<void>>();
   readonly #listeners = new Set<ChangeListener>();
   readonly #observer: Observer;
+  readonly #closing = new AbortController();
 
   constructor(deps: ContainerControlDeps) {
     this.#deps = deps;
@@ -135,6 +187,8 @@ export class ContainerControl {
 
   /** Let in-flight operations finish, then stop observing Railway. */
   async close(): Promise<void> {
+    // A Start still looking for its new deployment stops waiting; the next boot's observer picks it up.
+    this.#closing.abort();
     await this.settled();
     await this.#observer.close();
   }
@@ -174,6 +228,49 @@ export class ContainerControl {
     return this.#result(operationId, false);
   }
 
+  /**
+   * Record a Stop or Start. The container row is locked first, so a concurrent
+   * request for the same container waits here and then sees this one as active.
+   */
+  async requestAction(containerId: string, action: ContainerAction, idempotencyKey: string): Promise<RequestResult> {
+    const { db, clock } = this.#deps;
+    const operationId = randomUUID();
+    const now = clock.now();
+    try {
+      await transaction(db, async (client) => {
+        const locked = await client.query("SELECT id FROM containers WHERE id = $1 AND destroyed_at IS NULL FOR UPDATE", [containerId]);
+        if (locked.rowCount === 0) throw new ContainerNotFound();
+        // Checked after the lock: a request with the same key that got there first has committed by now.
+        const used = await client.query("SELECT 1 FROM operations WHERE idempotency_key = $1", [idempotencyKey]);
+        if ((used.rowCount ?? 0) > 0) throw new Replay();
+
+        const { rows } = await client.query<ContainerRow>(`${CONTAINERS_SQL} AND c.id = $1`, [containerId]);
+        const row = rows[0];
+        if (!row) throw new ContainerNotFound();
+        const allowed = availability(row, action);
+        if (!allowed.allowed) throw new ActionRefused(allowed.reason);
+
+        const inserted = await client.query(
+          `INSERT INTO operations (id, container_id, kind, status, idempotency_key, created_at, updated_at)
+           VALUES ($1, $2, $3, 'pending', $4, $5, $5)
+           ON CONFLICT (idempotency_key) DO NOTHING`,
+          [operationId, containerId, action, idempotencyKey, now],
+        );
+        if (inserted.rowCount === 0) throw new Replay();
+      });
+    } catch (error) {
+      if (error instanceof Replay) return this.#replay(idempotencyKey, action, containerId);
+      if (isUniqueViolation(error, "operations_one_active_per_container")) {
+        // Unreachable while the row lock above holds; the index is what guarantees it regardless.
+        throw new ActionRefused("Wait for the current operation to finish.");
+      }
+      throw error;
+    }
+    this.#publish(containerId);
+    this.#track(action === "stop" ? this.#driveStop(operationId) : this.#driveStart(operationId));
+    return this.#result(operationId, false);
+  }
+
   async listContainers(): Promise<ContainerView[]> {
     const { rows } = await this.#deps.db.query<ContainerRow>(`${CONTAINERS_SQL} ORDER BY c.created_at, c.id`);
     return rows.map(toView);
@@ -190,14 +287,16 @@ export class ContainerControl {
     while (this.#inFlight.size > 0) await Promise.all(this.#inFlight);
   }
 
-  async #replay(idempotencyKey: string, kind: OperationKind): Promise<RequestResult> {
-    const { rows } = await this.#deps.db.query<{ id: string; kind: OperationKind }>(
-      "SELECT id, kind FROM operations WHERE idempotency_key = $1",
+  async #replay(idempotencyKey: string, kind: OperationKind, containerId?: string): Promise<RequestResult> {
+    const { rows } = await this.#deps.db.query<{ id: string; kind: OperationKind; container_id: string }>(
+      "SELECT id, kind, container_id FROM operations WHERE idempotency_key = $1",
       [idempotencyKey],
     );
     const existing = rows[0];
     if (!existing) throw new Error("idempotency conflict without an existing operation");
-    if (existing.kind !== kind) throw new IdempotencyKeyReused(`key already used for ${existing.kind}`);
+    if (existing.kind !== kind || (containerId !== undefined && existing.container_id !== containerId)) {
+      throw new IdempotencyKeyReused(`key already used for ${existing.kind} on another request`);
+    }
     return this.#result(existing.id, true);
   }
 
@@ -238,6 +337,116 @@ export class ContainerControl {
     this.#observer.track(op.container_id);
   }
 
+  /** Mark a pending operation in progress and load what driving it needs. Null if it is not pending anymore. */
+  async #begin(
+    operationId: string,
+    { clearDeployment = false } = {},
+  ): Promise<{ container_id: string; service_id: string | null; deployment_id: string | null } | null> {
+    const { db, clock } = this.#deps;
+    return transaction(db, async (client) => {
+      const { rows } = await client.query<{ container_id: string; service_id: string | null; deployment_id: string | null }>(
+        `UPDATE operations o SET status = 'in_progress', attempts = attempts + 1, updated_at = $2
+         FROM containers c WHERE o.id = $1 AND c.id = o.container_id AND o.status = 'pending'
+         RETURNING o.container_id, c.service_id, c.current_deployment_id AS deployment_id`,
+        [operationId, clock.now()],
+      );
+      const op = rows[0];
+      if (op && clearDeployment) await client.query("UPDATE containers SET current_deployment_id = NULL WHERE id = $1", [op.container_id]);
+      return op ?? null;
+    });
+  }
+
+  /** A Stop completes when the observer sees the deployment stopped. */
+  async #driveStop(operationId: string): Promise<void> {
+    const op = await this.#begin(operationId);
+    if (!op) return;
+    if (!op.deployment_id) return this.#failAndPublish(operationId, op.container_id, "The container has no deployment to stop.");
+    const stopped = await this.#deps.railway.stopDeployment(op.deployment_id);
+    if (stopped.kind !== "ok") return this.#unsuccessful(operationId, op.container_id, stopped, "stopping the deployment");
+  }
+
+  /**
+   * A Start redeploys the service, which makes a new deployment with a new id.
+   * The current deployment is cleared while that happens, so nothing the old one
+   * reports (Railway removes it) is stored as the container's state; a process that
+   * dies here leaves it cleared, and the next boot's observer asks Railway for the latest.
+   */
+  async #driveStart(operationId: string): Promise<void> {
+    const { db, railway, clock } = this.#deps;
+    const op = await this.#begin(operationId, { clearDeployment: true });
+    if (!op) return;
+    const serviceId = op.service_id;
+    this.#observer.untrack(op.container_id);
+    const restore = async () => {
+      await db.query("UPDATE containers SET current_deployment_id = $2 WHERE id = $1 AND current_deployment_id IS NULL", [
+        op.container_id,
+        op.deployment_id,
+      ]);
+      this.#observer.track(op.container_id);
+    };
+    if (!serviceId) {
+      await restore();
+      return this.#failAndPublish(operationId, op.container_id, "The container has no Railway service to start.");
+    }
+
+    const redeployed = await railway.redeployService(serviceId);
+    if (redeployed.kind === "rejected" || redeployed.kind === "rate_limited") {
+      // Railway did not act: the old deployment is still the current one.
+      await restore();
+      return this.#unsuccessful(operationId, op.container_id, redeployed, "redeploying the service");
+    }
+    if (redeployed.kind === "ambiguous") {
+      // Railway may have started a new deployment; looking for one below tells.
+      await this.#unsuccessful(operationId, op.container_id, redeployed, "redeploying the service");
+    }
+
+    const found = await this.#newDeployment(serviceId, op.deployment_id);
+    if (found === "interrupted") return;
+    if (found === null) {
+      await restore();
+      if (redeployed.kind === "ambiguous") return; // stays flagged for the reconciler
+      return this.#failAndPublish(operationId, op.container_id, "Railway did not report a new deployment after the redeploy.");
+    }
+    await transaction(db, async (client) => {
+      await client.query(
+        `UPDATE containers SET current_deployment_id = $2, observed_status = $3, observed_stopped = $4, observed_at = $5
+         WHERE id = $1 AND current_deployment_id IS NULL`,
+        [op.container_id, found.deploymentId, found.status, found.stopped, clock.now()],
+      );
+      // A new deployment exists, so an ambiguous redeploy did happen.
+      await client.query("UPDATE operations SET last_outcome_ambiguous = false, last_error = NULL WHERE id = $1", [operationId]);
+    });
+    this.#publish(op.container_id);
+    this.#observer.track(op.container_id);
+  }
+
+  /**
+   * The deployment a redeploy produced: the service's latest one once it is not the
+   * one it replaced. Railway may list the old one for a moment, so it asks a few times.
+   */
+  async #newDeployment(serviceId: string, replaced: string | null): Promise<DeploymentState | null | "interrupted"> {
+    const { railway, clock } = this.#deps;
+    let backoff = LOOKUP_BACKOFF_MS;
+    for (let attempt = 1; attempt <= NEW_DEPLOYMENT_LOOKUPS; attempt++) {
+      const outcome = await railway.latestDeployment(serviceId);
+      if (outcome.kind === "ok" && outcome.value && outcome.value.deploymentId !== replaced) return outcome.value;
+      if (outcome.kind === "rejected") return null;
+      if (attempt === NEW_DEPLOYMENT_LOOKUPS) break;
+      try {
+        await clock.sleep(outcome.kind === "rate_limited" ? outcome.retryAfterMs : backoff, this.#closing.signal);
+      } catch {
+        return "interrupted";
+      }
+      backoff = Math.min(backoff * 2, MAX_LOOKUP_BACKOFF_MS);
+    }
+    return null;
+  }
+
+  async #failAndPublish(operationId: string, containerId: string, message: string): Promise<void> {
+    await this.#fail(operationId, message, null);
+    this.#publish(containerId);
+  }
+
   /** A call that did not succeed: fail the operation, or leave it active and flagged when Railway may have acted. */
   async #unsuccessful(
     operationId: string,
@@ -265,21 +474,26 @@ export class ContainerControl {
     this.#publish(containerId);
   }
 
-  /** A create completes when its deployment is observed to succeed, and fails if Railway gives up on it. */
+  /**
+   * An operation completes when Railway is observed to reach what it asked for:
+   * Create and Start a running deployment, Stop a stopped one. Any of them fails
+   * if Railway gives up on the deployment.
+   */
   async #onObserved(containerId: string, state: DeploymentState, changed: boolean): Promise<void> {
     const { db, clock } = this.#deps;
     let settled = 0;
-    if (state.status === "SUCCESS" && !state.stopped) {
+    if (state.status === "SUCCESS") {
+      const kinds = state.stopped ? ["stop"] : ["create", "start"];
       const result = await db.query(
         `UPDATE operations SET status = 'succeeded', updated_at = $2
-         WHERE container_id = $1 AND kind = 'create' AND status = 'in_progress'`,
-        [containerId, clock.now()],
+         WHERE container_id = $1 AND kind = ANY($3) AND status = 'in_progress'`,
+        [containerId, clock.now(), kinds],
       );
       settled = result.rowCount ?? 0;
     } else if (DEPLOYMENT_FAILED_STATUSES.has(state.status)) {
       const result = await db.query(
         `UPDATE operations SET status = 'failed', last_error = $2, updated_at = $3
-         WHERE container_id = $1 AND kind = 'create' AND status = 'in_progress'`,
+         WHERE container_id = $1 AND kind IN ('create', 'start', 'stop') AND status = 'in_progress'`,
         [containerId, `Railway reports the deployment as ${state.status}.`, clock.now()],
       );
       settled = result.rowCount ?? 0;

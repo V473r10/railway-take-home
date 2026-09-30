@@ -1,11 +1,51 @@
 import { useEffect, useState } from "react";
-import { applyEvent, type Container, createContainer, subscribeToContainers } from "./api.ts";
+import { applyEvent, type Container, type ContainerAction, createContainer, requestAction, subscribeToContainers } from "./api.ts";
+
+const ACTION_LABEL: Record<ContainerAction, string> = { stop: "Stop", start: "Start" };
+
+/**
+ * Stop and Start for one container. Availability comes from the server, so a
+ * button is disabled for the same reason the API would refuse the click.
+ */
+function ContainerActions({ container, sending, onAction }: {
+  container: Container;
+  sending: boolean;
+  onAction: (action: ContainerAction) => void;
+}) {
+  const { stop, start } = container.actions;
+  // When nothing can be done, say why; disabled buttons cannot be focused to find out.
+  const hint = !stop.allowed && !start.allowed ? start.reason : null;
+  const hintId = `actions-hint-${container.id}`;
+  return (
+    <div className="row-actions">
+      {(["stop", "start"] as const).map((action) => (
+        <button
+          key={action}
+          type="button"
+          onClick={() => onAction(action)}
+          disabled={sending || !container.actions[action].allowed}
+          aria-describedby={hint ? hintId : undefined}
+        >
+          {ACTION_LABEL[action]}
+          <span className="visually-hidden"> {container.name}</span>
+        </button>
+      ))}
+      {hint && (
+        <small id={hintId} className="hint">
+          {hint}
+        </small>
+      )}
+    </div>
+  );
+}
 
 export function App() {
   const [containers, setContainers] = useState<Container[] | null>(null);
   const [connected, setConnected] = useState(true);
   const [error, setError] = useState<string | null>(null);
   const [creating, setCreating] = useState(false);
+  // Containers with a Stop or Start request on its way to the server.
+  const [sending, setSending] = useState<ReadonlySet<string>>(new Set());
 
   useEffect(
     () =>
@@ -29,6 +69,22 @@ export function App() {
       setError(e instanceof Error ? e.message : String(e));
     } finally {
       setCreating(false);
+    }
+  };
+
+  const onAction = async (containerId: string, action: ContainerAction) => {
+    setSending((ids) => new Set(ids).add(containerId));
+    try {
+      await requestAction(containerId, action, crypto.randomUUID());
+      setError(null);
+    } catch (e) {
+      setError(e instanceof Error ? e.message : String(e));
+    } finally {
+      setSending((ids) => {
+        const next = new Set(ids);
+        next.delete(containerId);
+        return next;
+      });
     }
   };
 
@@ -68,6 +124,7 @@ export function App() {
               <th scope="col">State</th>
               <th scope="col">Public URL</th>
               <th scope="col">Created</th>
+              <th scope="col">Actions</th>
             </tr>
           </thead>
           <tbody aria-live="polite">
@@ -97,6 +154,9 @@ export function App() {
                 </td>
                 <td>
                   <time dateTime={c.createdAt}>{new Date(c.createdAt).toLocaleTimeString()}</time>
+                </td>
+                <td>
+                  <ContainerActions container={c} sending={sending.has(c.id)} onAction={(action) => void onAction(c.id, action)} />
                 </td>
               </tr>
             ))}

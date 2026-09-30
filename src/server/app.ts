@@ -4,11 +4,12 @@ import { join, relative } from "node:path";
 import { serveStatic } from "@hono/node-server/serve-static";
 import { Hono } from "hono";
 import { streamSSE } from "hono/streaming";
-import { type ContainerControl, IdempotencyKeyReused } from "./containers.ts";
+import { ActionRefused, ContainerNotFound, type ContainerControl, IdempotencyKeyReused } from "./containers.ts";
 import { LiveFeed } from "./live.ts";
 
 // Printable ASCII, the shape of a UUID or similar client-generated token.
 const IDEMPOTENCY_KEY = /^[\x21-\x7e]{8,200}$/;
+const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 const SSE_RETRY_MS = 2_000;
 const SSE_HEARTBEAT_MS = 20_000;
 
@@ -51,6 +52,26 @@ export function createApp({ control, webRoot, log }: AppDeps): Hono {
       c.header("Idempotent-Replayed", String(result.replayed));
       return c.json({ operation: result.operation, container: result.container }, result.replayed ? 200 : 202);
     } catch (error) {
+      if (error instanceof IdempotencyKeyReused) return c.json({ error: "This Idempotency-Key was already used for a different action." }, 422);
+      throw error;
+    }
+  });
+
+  app.post("/api/containers/:id/:action{stop|start}", async (c) => {
+    const key = c.req.header("Idempotency-Key");
+    if (!key || !IDEMPOTENCY_KEY.test(key)) {
+      return c.json({ error: "Every write needs an Idempotency-Key header (8-200 printable characters)." }, 400);
+    }
+    const id = c.req.param("id");
+    const action = c.req.param("action") === "stop" ? "stop" : "start";
+    if (!UUID.test(id)) return c.json({ error: "No such container." }, 404);
+    try {
+      const result = await control.requestAction(id, action, key);
+      c.header("Idempotent-Replayed", String(result.replayed));
+      return c.json({ operation: result.operation, container: result.container }, result.replayed ? 200 : 202);
+    } catch (error) {
+      if (error instanceof ContainerNotFound) return c.json({ error: "No such container." }, 404);
+      if (error instanceof ActionRefused) return c.json({ error: error.message }, 409);
       if (error instanceof IdempotencyKeyReused) return c.json({ error: "This Idempotency-Key was already used for a different action." }, 422);
       throw error;
     }

@@ -11,6 +11,10 @@ export type ContainerState =
   | "crashed"
   | "missing";
 
+export type Availability = { allowed: true } | { allowed: false; reason: string };
+
+export type ContainerAction = "stop" | "start";
+
 export type Container = {
   id: string;
   name: string;
@@ -18,6 +22,8 @@ export type Container = {
   url: string | null;
   createdAt: string;
   lastError: { message: string; traceId: string | null } | null;
+  /** Decided by the server with the same rule that refuses a request. */
+  actions: Record<ContainerAction, Availability>;
 };
 
 export type LiveEvent =
@@ -58,5 +64,14 @@ async function readError(res: Response): Promise<string> {
 /** One key per click: resending the same click (a retry, a double submit) reuses it. */
 export async function createContainer(idempotencyKey: string): Promise<void> {
   const res = await fetch("/api/containers", { method: "POST", headers: { "Idempotency-Key": idempotencyKey } });
+  if (!res.ok) throw new Error(await readError(res));
+}
+
+/** Stop or Start a container. Like Create, one key per click. */
+export async function requestAction(containerId: string, action: ContainerAction, idempotencyKey: string): Promise<void> {
+  const res = await fetch(`/api/containers/${encodeURIComponent(containerId)}/${action}`, {
+    method: "POST",
+    headers: { "Idempotency-Key": idempotencyKey },
+  });
   if (!res.ok) throw new Error(await readError(res));
 }

@@ -189,3 +189,29 @@ describe("GraphqlRailway.watchDeployment", () => {
     expect(ends).toEqual([]);
   });
 });
+
+describe("GraphqlRailway stop and start", () => {
+  const sent = (captured: Captured[]) => JSON.parse(String(captured[0]?.init.body)) as { query: string; variables: unknown };
+
+  it("stops with deploymentStop on the deployment id", async () => {
+    const { adapter, captured } = adapterReturning(() => json({ data: { deploymentStop: true } }));
+
+    expect(await adapter.stopDeployment("dep-7")).toEqual({ kind: "ok", value: undefined });
+    expect(sent(captured).query).toContain("deploymentStop(id:$id)");
+    expect(sent(captured).variables).toEqual({ id: "dep-7" });
+  });
+
+  it("starts with serviceInstanceRedeploy on the service in the sandbox environment", async () => {
+    const { adapter, captured } = adapterReturning(() => json({ data: { serviceInstanceRedeploy: true } }));
+
+    expect(await adapter.redeployService("svc-3")).toEqual({ kind: "ok", value: undefined });
+    expect(sent(captured).query).toContain("serviceInstanceRedeploy(serviceId:$s, environmentId:$e)");
+    expect(sent(captured).variables).toEqual({ s: "svc-3", e: "env-1" });
+  });
+
+  it("classifies a refused stop like any other call", async () => {
+    const { adapter } = adapterReturning(() => json({ data: null, errors: [{ message: "Deployment not found", extensions: { traceId: "t-4" } }] }));
+
+    expect(await adapter.stopDeployment("dep-x")).toMatchObject({ kind: "rejected", message: "Deployment not found", traceId: "t-4" });
+  });
+});

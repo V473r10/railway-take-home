@@ -24,7 +24,12 @@ export type FakeCall =
   | { method: "createDomain"; serviceId: string }
   | { method: "latestDeployment"; serviceId: string }
   | { method: "readDeployment"; deploymentId: string }
-  | { method: "watchDeployment"; deploymentId: string };
+  | { method: "watchDeployment"; deploymentId: string }
+  | { method: "stopDeployment"; deploymentId: string }
+  | { method: "redeployService"; serviceId: string };
+
+/** The calls that change something on Railway, and so can have failures injected. */
+export type FakeMutation = "createContainer" | "stopDeployment" | "redeployService";
 
 export type FakeRailwayOptions = {
   /** Move every new deployment to SUCCESS after this long (local development only; tests move it by hand). */
@@ -41,7 +46,10 @@ export class FakeRailway implements RailwayAdapter {
   readonly services = new Map<string, FakeService>();
   readonly deployments = new Map<string, DeploymentState>();
   readonly #options: FakeRailwayOptions;
-  #failures: InjectedFailure[] = [];
+  #failures = new Map<FakeMutation, InjectedFailure[]>();
+  #staleLatest = 0;
+  /** Per service, the deployment its last redeploy replaced (what a lagging list still shows). */
+  #replaced = new Map<string, string>();
   #watches = new Map<string, Set<DeploymentWatch>>();
   #refuseSubscriptions = false;
   #nextId = 1;
@@ -58,7 +66,17 @@ export class FakeRailway implements RailwayAdapter {
 
   /** Queue failures for createContainer; each call consumes one before behaving normally. */
   failNext(...failures: InjectedFailure[]): void {
-    this.#failures.push(...failures);
+    this.failNextOn("createContainer", ...failures);
+  }
+
+  /** Queue failures for one mutation; each call to it consumes one before behaving normally. */
+  failNextOn(method: FakeMutation, ...failures: InjectedFailure[]): void {
+    this.#failures.set(method, [...(this.#failures.get(method) ?? []), ...failures]);
+  }
+
+  /** The next `calls` latestDeployment calls after a redeploy still list the replaced deployment, as Railway may for a moment. */
+  lagNewDeployments(calls: number): void {
+    this.#staleLatest = calls;
   }
 
   /** Hold every createContainer call until the returned release function is invoked. */
@@ -102,12 +120,9 @@ export class FakeRailway implements RailwayAdapter {
   async createContainer(input: CreateContainerInput): Promise<Outcome<CreatedService>> {
     this.calls.push({ method: "createContainer", input });
     if (this.#gate) await this.#gate;
-    const failure = this.#failures.shift();
-    if (failure?.kind === "ambiguous_before_acting") return { kind: "ambiguous", reason: "fake: request lost" };
-    if (failure?.kind === "rejected") {
-      return { kind: "rejected", message: failure.message, code: failure.code ?? null, traceId: failure.traceId ?? null };
-    }
-    if (failure?.kind === "rate_limited") return failure;
+    const failure = this.#failures.get("createContainer")?.shift();
+    const early = failedBeforeActing(failure);
+    if (early) return early;
 
     const n = this.#nextId++;
     // Like Railway with `source.image`: creating the service also starts its first deployment.
@@ -119,6 +134,45 @@ export class FakeRailway implements RailwayAdapter {
     }
     if (failure?.kind === "ambiguous_after_acting") return { kind: "ambiguous", reason: "fake: response lost" };
     return { kind: "ok", value: { serviceId: service.id } };
+  }
+
+  async stopDeployment(deploymentId: string): Promise<Outcome<void>> {
+    this.calls.push({ method: "stopDeployment", deploymentId });
+    const failure = this.#failures.get("stopDeployment")?.shift();
+    const early = failedBeforeActing(failure);
+    if (early) return early;
+    const state = this.deployments.get(deploymentId);
+    if (!state) return notFound("Deployment not found");
+    // Railway takes a moment to stop it; tests move it with setDeployment(..., "SUCCESS", true).
+    if (this.#options.autoSucceedAfterMs !== undefined) {
+      const service = [...this.services.values()].find((s) => s.deploymentId === deploymentId);
+      if (service) setTimeout(() => this.setDeployment(service.id, "SUCCESS", true), this.#options.autoSucceedAfterMs).unref();
+    }
+    if (failure?.kind === "ambiguous_after_acting") return { kind: "ambiguous", reason: "fake: response lost" };
+    return { kind: "ok", value: undefined };
+  }
+
+  async redeployService(serviceId: string): Promise<Outcome<void>> {
+    this.calls.push({ method: "redeployService", serviceId });
+    const failure = this.#failures.get("redeployService")?.shift();
+    const early = failedBeforeActing(failure);
+    if (early) return early;
+    const service = this.services.get(serviceId);
+    if (!service) return notFound("Service not found");
+
+    // A redeploy is a new deployment with a new id; the one it replaces is removed.
+    const replaced = service.deploymentId;
+    service.deploymentId = `dep-${this.#nextId++}`;
+    this.deployments.set(service.deploymentId, { deploymentId: service.deploymentId, status: "DEPLOYING", stopped: false });
+    const removed: DeploymentState = { deploymentId: replaced, status: "REMOVED", stopped: false };
+    this.deployments.set(replaced, removed);
+    for (const w of this.#watches.get(replaced) ?? []) w.onState({ ...removed });
+    this.#replaced.set(serviceId, replaced);
+    if (this.#options.autoSucceedAfterMs !== undefined) {
+      setTimeout(() => this.setDeployment(service.id, "SUCCESS"), this.#options.autoSucceedAfterMs).unref();
+    }
+    if (failure?.kind === "ambiguous_after_acting") return { kind: "ambiguous", reason: "fake: response lost" };
+    return { kind: "ok", value: undefined };
   }
 
   async createDomain(serviceId: string): Promise<Outcome<PublicDomain>> {
@@ -133,6 +187,11 @@ export class FakeRailway implements RailwayAdapter {
     this.calls.push({ method: "latestDeployment", serviceId });
     const service = this.services.get(serviceId);
     if (!service) return notFound("Service not found");
+    const replaced = this.deployments.get(this.#replaced.get(serviceId) ?? "");
+    if (this.#staleLatest > 0 && replaced) {
+      this.#staleLatest--;
+      return { kind: "ok", value: { ...replaced } };
+    }
     const state = this.deployments.get(service.deploymentId);
     return { kind: "ok", value: state ? { ...state } : null };
   }
@@ -155,6 +214,20 @@ export class FakeRailway implements RailwayAdapter {
     return () => {
       set.delete(watch);
     };
+  }
+}
+
+/** The outcome of an injected failure that stops the call before Railway acts, if it is one. */
+function failedBeforeActing(failure: InjectedFailure | undefined): Outcome<never> | null {
+  switch (failure?.kind) {
+    case "ambiguous_before_acting":
+      return { kind: "ambiguous", reason: "fake: request lost" };
+    case "rejected":
+      return { kind: "rejected", message: failure.message, code: failure.code ?? null, traceId: failure.traceId ?? null };
+    case "rate_limited":
+      return failure;
+    default:
+      return null;
   }
 }
 
