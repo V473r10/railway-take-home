@@ -8,6 +8,7 @@ import {
   DEPLOYMENT_FAILED_STATUSES,
   type DeploymentState,
   type Outcome,
+  type PublicDomain,
   type RailwayAdapter,
   serviceNameFor,
 } from "./railway/adapter.ts";
@@ -149,7 +150,18 @@ const CONTAINERS_SQL = `
 
 class Replay extends Error {}
 
-type BegunOperation = { container_id: string; name: string; service_id: string | null; deployment_id: string | null };
+type BegunOperation = {
+  container_id: string;
+  name: string;
+  service_id: string | null;
+  domain: string | null;
+  /** The container's current deployment when the drive began. */
+  deployment_id: string | null;
+  /** A Start's: the deployment its redeploy replaces. */
+  replaced_deployment_id: string | null;
+  /** A previous process already began this operation and stopped before it finished. */
+  resumed: boolean;
+};
 
 const RETRY = { kind: "retry" } as const;
 
@@ -196,9 +208,30 @@ export class ContainerControl {
     });
   }
 
-  /** Begin observing the containers that already exist. */
+  /**
+   * Reconcile, then observe. An operation still active in the database was left by a
+   * process that stopped mid-way, so Railway may or may not have acted on its last call.
+   * Each one is resumed: it looks at Railway first and then does only what is still
+   * missing, so nothing is duplicated (ADR 0004). Every resumed drive is claimed here,
+   * before the app accepts requests, and the one-active-operation rule keeps a new
+   * request from interleaving with it; Destroy can still interrupt it, as always.
+   */
   async start(): Promise<void> {
-    await this.#observer.start();
+    const { rows } = await this.#deps.db.query<{ id: string; kind: OperationKind; container_id: string }>(
+      "SELECT id, kind, container_id FROM operations WHERE status IN ('pending', 'in_progress') ORDER BY seq",
+    );
+    // A Destroy supersedes whatever else its container was doing; only the Destroy is resumed.
+    const destroying = new Set(rows.filter((r) => r.kind === "destroy").map((r) => r.container_id));
+    const resumed = rows.filter((r) => r.kind === "destroy" || !destroying.has(r.container_id));
+    // A resumed Create, Start or Destroy decides itself when its container is watched.
+    await this.#observer.start(new Set(resumed.filter((r) => r.kind !== "stop").map((r) => r.container_id)));
+    if (resumed.length > 0) (this.#deps.log ?? console.error)(`reconciling ${resumed.length} operation(s) left active by a previous process`);
+    for (const op of resumed) {
+      if (op.kind === "destroy") this.#track(this.#driveDestroy(op.id, op.container_id, { resume: true }));
+      else if (op.kind === "create") this.#trackDrive(op.container_id, (signal) => this.#driveCreate(op.id, signal, { resume: true }));
+      else if (op.kind === "stop") this.#trackDrive(op.container_id, (signal) => this.#driveStop(op.id, signal, { resume: true }));
+      else this.#trackDrive(op.container_id, (signal) => this.#driveStart(op.id, signal, { resume: true }));
+    }
   }
 
   /** Let in-flight operations finish, then stop observing Railway. */
@@ -331,70 +364,105 @@ export class ContainerControl {
     return { operation: { id: op.id, kind: op.kind, status: op.status }, container, replayed };
   }
 
-  async #driveCreate(operationId: string, signal: AbortSignal): Promise<void> {
-    const { db, railway, clock } = this.#deps;
-    const { rows } = await db.query<{ container_id: string; name: string }>(
-      `UPDATE operations o SET status = 'in_progress', attempts = attempts + 1, updated_at = $2
-       FROM containers c WHERE o.id = $1 AND c.id = o.container_id AND o.status = 'pending'
-       RETURNING o.container_id, c.name`,
-      [operationId, clock.now()],
-    );
-    const op = rows[0];
+  async #driveCreate(operationId: string, signal: AbortSignal, { resume = false } = {}): Promise<void> {
+    const { db, railway } = this.#deps;
+    const op = await this.#begin(operationId, { resume });
     if (!op) return;
 
-    // serviceCreate takes no idempotency key, so before repeating a create that may have
-    // acted, look for the service by the name this operation gave it (ADR 0004).
-    const created = await this.#call(operationId, () => railway.createContainer({ name: op.name, image: CONTAINER_IMAGE }), {
-      signal,
-      lookup: async () => lookupFrom(await railway.findService(op.name), (found) => (found ? done(found) : RETRY)),
-    });
-    if (created.kind !== "ok") return this.#unsuccessful(operationId, op.container_id, created, "creating the service");
+    let serviceId = op.service_id;
+    if (!serviceId && op.resumed) {
+      // The previous process may have created the service and died before recording it.
+      const found = await this.#call(operationId, () => railway.findService(op.name), { signal });
+      if (found.kind !== "ok") return this.#unsuccessful(operationId, op.container_id, found, "looking for the service");
+      serviceId = found.value?.serviceId ?? null;
+    }
+    if (!serviceId) {
+      // serviceCreate takes no idempotency key, so before repeating a create that may have
+      // acted, look for the service by the name this operation gave it (ADR 0004).
+      const created = await this.#call(operationId, () => railway.createContainer({ name: op.name, image: CONTAINER_IMAGE }), {
+        signal,
+        lookup: async () => lookupFrom(await railway.findService(op.name), (found) => (found ? done(found) : RETRY)),
+      });
+      if (created.kind !== "ok") return this.#unsuccessful(operationId, op.container_id, created, "creating the service");
+      serviceId = created.value.serviceId;
+    }
     // Recorded even when a Destroy is waiting, so the Destroy knows which service to delete.
-    await db.query("UPDATE containers SET service_id = $2 WHERE id = $1", [op.container_id, created.value.serviceId]);
+    if (serviceId !== op.service_id) await db.query("UPDATE containers SET service_id = $2 WHERE id = $1", [op.container_id, serviceId]);
     if (signal.aborted) return;
 
     // The domain comes before observing, so a container is never shown running without its URL.
-    const serviceId = created.value.serviceId;
-    const domain = await this.#call(operationId, () => railway.createDomain(serviceId), {
-      signal,
-      lookup: async () => lookupFrom(await railway.serviceDomain(serviceId), (found) => (found ? done(found) : RETRY)),
-    });
-    if (domain.kind === "ok") {
-      await db.query("UPDATE containers SET domain = $2 WHERE id = $1", [op.container_id, domain.value.domain]);
-      this.#publish(op.container_id);
-    } else {
-      await this.#unsuccessful(operationId, op.container_id, domain, "creating the public domain");
+    if (!op.domain) {
+      const domain = await this.#domainFor(operationId, serviceId, op.resumed, signal);
+      if (domain.kind === "ok") {
+        await db.query("UPDATE containers SET domain = $2 WHERE id = $1", [op.container_id, domain.value.domain]);
+        this.#publish(op.container_id);
+      } else {
+        await this.#unsuccessful(operationId, op.container_id, domain, "creating the public domain");
+      }
     }
     // Observed state is the truth either way; the operation completes when the deployment succeeds.
     this.#observer.track(op.container_id);
   }
 
-  /** Mark a pending operation in progress and load what driving it needs. Null if it is not pending anymore. */
-  async #begin(
-    operationId: string,
-    { clearDeployment = false } = {},
-  ): Promise<BegunOperation | null> {
+  /** The service's public domain: the one it has, when resuming, or a new one. */
+  async #domainFor(operationId: string, serviceId: string, resumed: boolean, signal: AbortSignal): Promise<Outcome<PublicDomain>> {
+    const { railway } = this.#deps;
+    if (resumed) {
+      const found = await this.#call(operationId, () => railway.serviceDomain(serviceId), { signal });
+      if (found.kind !== "ok") return found;
+      if (found.value) return { kind: "ok", value: found.value };
+    }
+    return this.#call(operationId, () => railway.createDomain(serviceId), {
+      signal,
+      lookup: async () => lookupFrom(await railway.serviceDomain(serviceId), (found) => (found ? done(found) : RETRY)),
+    });
+  }
+
+  /**
+   * Mark an operation in progress and load what driving it needs. Null if it is not
+   * pending anymore; when resuming, one a previous process left in progress is taken too.
+   * A Start (`clearDeployment`) records the deployment it replaces and clears the
+   * container's current one, unless a resumed Start already recorded its new one.
+   */
+  async #begin(operationId: string, { clearDeployment = false, resume = false } = {}): Promise<BegunOperation | null> {
     const { db, clock } = this.#deps;
     return transaction(db, async (client) => {
-      const { rows } = await client.query<BegunOperation>(
+      const prior = await client.query<{ status: OperationStatus }>("SELECT status FROM operations WHERE id = $1 FOR UPDATE", [operationId]);
+      const status = prior.rows[0]?.status;
+      const resumed = resume && status === "in_progress";
+      if (status !== "pending" && !resumed) return null;
+      const { rows } = await client.query<Omit<BegunOperation, "resumed">>(
         `UPDATE operations o SET status = 'in_progress', attempts = attempts + 1, updated_at = $2
-         FROM containers c WHERE o.id = $1 AND c.id = o.container_id AND o.status = 'pending'
-         RETURNING o.container_id, c.name, c.service_id, c.current_deployment_id AS deployment_id`,
+         FROM containers c WHERE o.id = $1 AND c.id = o.container_id
+         RETURNING o.container_id, c.name, c.service_id, c.domain, c.current_deployment_id AS deployment_id, o.replaced_deployment_id`,
         [operationId, clock.now()],
       );
-      const op = rows[0];
-      if (op && clearDeployment) await client.query("UPDATE containers SET current_deployment_id = NULL WHERE id = $1", [op.container_id]);
-      return op ?? null;
+      const row = rows[0];
+      if (!row) return null;
+      const op: BegunOperation = { ...row, resumed };
+      if (clearDeployment && !resumed) {
+        op.replaced_deployment_id = op.deployment_id;
+        await client.query("UPDATE operations SET replaced_deployment_id = $2 WHERE id = $1", [operationId, op.deployment_id]);
+      }
+      const recordedNew = resumed && op.deployment_id !== null && op.deployment_id !== op.replaced_deployment_id;
+      if (clearDeployment && !recordedNew) await client.query("UPDATE containers SET current_deployment_id = NULL WHERE id = $1", [op.container_id]);
+      return op;
     });
   }
 
   /** A Stop completes when the observer sees the deployment stopped. */
-  async #driveStop(operationId: string, signal: AbortSignal): Promise<void> {
+  async #driveStop(operationId: string, signal: AbortSignal, { resume = false } = {}): Promise<void> {
     const { railway } = this.#deps;
-    const op = await this.#begin(operationId);
+    const op = await this.#begin(operationId, { resume });
     if (!op) return;
     const deploymentId = op.deployment_id;
     if (!deploymentId) return this.#failAndPublish(operationId, op.container_id, "The container has no deployment to stop.");
+    if (op.resumed) {
+      const seen = await this.#call(operationId, () => railway.readDeployment(deploymentId), { signal });
+      if (seen.kind !== "ok") return this.#unsuccessful(operationId, op.container_id, seen, "reading the deployment");
+      // The previous process's stop did act: the observer completes the Stop from what it reads.
+      if (seen.value.stopped) return;
+    }
     const stopped = await this.#call(operationId, () => railway.stopDeployment(deploymentId), {
       signal,
       lookup: async () => lookupFrom(await railway.readDeployment(deploymentId), (state) => (state.stopped ? done(undefined) : RETRY)),
@@ -406,18 +474,25 @@ export class ContainerControl {
    * A Start redeploys the service, which makes a new deployment with a new id.
    * The current deployment is cleared while that happens, so nothing the old one
    * reports (Railway removes it) is stored as the container's state; a process that
-   * dies here leaves it cleared, and the next boot's observer asks Railway for the latest.
+   * dies here leaves it cleared, and the next boot resumes the Start from the replaced
+   * deployment recorded on the operation.
    */
-  async #driveStart(operationId: string, signal: AbortSignal): Promise<void> {
-    const { db, railway, clock } = this.#deps;
-    const op = await this.#begin(operationId, { clearDeployment: true });
+  async #driveStart(operationId: string, signal: AbortSignal, { resume = false } = {}): Promise<void> {
+    const { db, railway } = this.#deps;
+    const op = await this.#begin(operationId, { clearDeployment: true, resume });
     if (!op) return;
     const serviceId = op.service_id;
+    const replaced = op.replaced_deployment_id;
+    if (op.resumed && op.deployment_id !== null && op.deployment_id !== replaced) {
+      // The previous process recorded the new deployment; the observer completes the Start.
+      this.#observer.track(op.container_id);
+      return;
+    }
     this.#observer.untrack(op.container_id);
     const restore = async () => {
       await db.query("UPDATE containers SET current_deployment_id = $2 WHERE id = $1 AND current_deployment_id IS NULL", [
         op.container_id,
-        op.deployment_id,
+        replaced,
       ]);
       this.#observer.track(op.container_id);
     };
@@ -426,12 +501,22 @@ export class ContainerControl {
       return this.#failAndPublish(operationId, op.container_id, "The container has no Railway service to start.");
     }
 
+    if (op.resumed) {
+      // The previous process's redeploy may have acted: a deployment newer than the replaced one says so.
+      const latest = await this.#call(operationId, () => railway.latestDeployment(serviceId), { signal });
+      if (latest.kind !== "ok") {
+        await restore();
+        return this.#unsuccessful(operationId, op.container_id, latest, "looking for the new deployment");
+      }
+      if (latest.value && latest.value.deploymentId !== replaced) return this.#adoptDeployment(operationId, op.container_id, latest.value);
+    }
+
     // A redeploy that acted shows up as a newer deployment; only without one is it repeated.
     const redeployed = await this.#call(operationId, () => railway.redeployService(serviceId), {
       signal,
       lookup: async () =>
         lookupFrom(await railway.latestDeployment(serviceId), (latest) =>
-          latest && latest.deploymentId !== op.deployment_id ? done(undefined) : RETRY,
+          latest && latest.deploymentId !== replaced ? done(undefined) : RETRY,
         ),
     });
     if (redeployed.kind === "rejected" || redeployed.kind === "rate_limited") {
@@ -444,24 +529,30 @@ export class ContainerControl {
       await this.#unsuccessful(operationId, op.container_id, redeployed, "redeploying the service");
     }
 
-    const found = await this.#newDeployment(serviceId, op.deployment_id, signal);
+    const found = await this.#newDeployment(serviceId, replaced, signal);
     if (found === "interrupted") return;
     if (found === null) {
       await restore();
       if (redeployed.kind === "ambiguous") return; // stays flagged for the reconciler
       return this.#failAndPublish(operationId, op.container_id, "Railway did not report a new deployment after the redeploy.");
     }
+    await this.#adoptDeployment(operationId, op.container_id, found);
+  }
+
+  /** Make a Start's new deployment the container's current one, and watch it. */
+  async #adoptDeployment(operationId: string, containerId: string, found: DeploymentState): Promise<void> {
+    const { db, clock } = this.#deps;
     await transaction(db, async (client) => {
       await client.query(
         `UPDATE containers SET current_deployment_id = $2, observed_status = $3, observed_stopped = $4, observed_at = $5
          WHERE id = $1 AND current_deployment_id IS NULL`,
-        [op.container_id, found.deploymentId, found.status, found.stopped, clock.now()],
+        [containerId, found.deploymentId, found.status, found.stopped, clock.now()],
       );
       // A new deployment exists, so an ambiguous redeploy did happen.
       await client.query("UPDATE operations SET last_outcome_ambiguous = false, last_error = NULL WHERE id = $1", [operationId]);
     });
-    this.#publish(op.container_id);
-    this.#observer.track(op.container_id);
+    this.#publish(containerId);
+    this.#observer.track(containerId);
   }
 
   /**
@@ -491,14 +582,14 @@ export class ContainerControl {
    * waits for the drive in flight first: a Create still waiting on serviceCreate
    * would otherwise record a service after it was deleted, or leave one nobody tracks.
    */
-  async #driveDestroy(operationId: string, containerId: string): Promise<void> {
+  async #driveDestroy(operationId: string, containerId: string, { resume = false } = {}): Promise<void> {
     const { db, railway, clock } = this.#deps;
     const prior = this.#drives.get(containerId);
     if (prior) {
       prior.abort.abort();
       await prior.done;
     }
-    const op = await this.#begin(operationId);
+    const op = await this.#begin(operationId, { resume });
     if (!op) return;
     await db.query(
       `UPDATE operations SET status = 'failed', last_error = 'Superseded by Destroy.', updated_at = $2
@@ -508,8 +599,9 @@ export class ContainerControl {
     this.#observer.untrack(containerId);
 
     let serviceId = op.service_id;
-    if (!serviceId && (await this.#createWasAmbiguous(containerId))) {
-      // Railway never confirmed a service, but the create may have made one: it has the container's name.
+    // A resumed Destroy may have deleted the service already, and a create Railway never
+    // confirmed may have made one anyway. Either way the container's name tells.
+    if (op.resumed || (!serviceId && (await this.#createWasAmbiguous(containerId)))) {
       const found = await this.#call(operationId, () => railway.findService(op.name), { signal: this.#closing.signal });
       if (found.kind !== "ok") {
         this.#observer.track(containerId);
