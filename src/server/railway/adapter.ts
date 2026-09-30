@@ -20,6 +20,9 @@ export type CreateContainerInput = {
 
 export type CreatedService = { serviceId: string };
 
+/** A service in the sandbox project: one of the app's containers, or anyone else's. */
+export type SandboxService = { serviceId: string; name: string };
+
 export type PublicDomain = { domain: string };
 
 /**
@@ -48,6 +51,12 @@ export interface RailwayAdapter {
   createContainer(input: CreateContainerInput): Promise<Outcome<CreatedService>>;
   /** The service with this name in the sandbox project, or null. How an ambiguous create is resolved (ADR 0004). */
   findService(name: string): Promise<Outcome<CreatedService | null>>;
+  /**
+   * Every service in the sandbox project. How the app tells a container whose service
+   * was deleted outside it (missing). Includes services the app did not create: only
+   * a row in `containers` makes a service a container, never its name.
+   */
+  listServices(): Promise<Outcome<SandboxService[]>>;
   /** Give the service a public Railway domain routed to the image's port. */
   createDomain(serviceId: string): Promise<Outcome<PublicDomain>>;
   /** The service's public Railway domain, or null while it has none. */

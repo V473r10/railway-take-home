@@ -7,6 +7,7 @@ import {
   type Outcome,
   type PublicDomain,
   type RailwayAdapter,
+  type SandboxService,
   type TokenIdentity,
 } from "./adapter.ts";
 
@@ -96,14 +97,18 @@ export class GraphqlRailway implements RailwayAdapter {
   }
 
   async findService(name: string): Promise<Outcome<CreatedService | null>> {
+    return mapOk(await this.listServices(), (services) => {
+      const found = services.find((s) => s.name === name);
+      return found ? { serviceId: found.serviceId } : null;
+    });
+  }
+
+  async listServices(): Promise<Outcome<SandboxService[]>> {
     const outcome = await this.#request<{ project: { services: { edges: { node: { id: string; name: string } }[] } } }>(
       "query($id:String!){ project(id:$id){ services{ edges{ node{ id name } } } } }",
       { id: this.#config.projectId },
     );
-    return mapOk(outcome, (d) => {
-      const node = d.project.services.edges.find((e) => e.node.name === name)?.node;
-      return node ? { serviceId: node.id } : null;
-    });
+    return mapOk(outcome, (d) => d.project.services.edges.map((e) => ({ serviceId: e.node.id, name: e.node.name })));
   }
 
   async serviceDomain(serviceId: string): Promise<Outcome<PublicDomain | null>> {

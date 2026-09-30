@@ -6,6 +6,7 @@ import type {
   Outcome,
   PublicDomain,
   RailwayAdapter,
+  SandboxService,
   TokenIdentity,
 } from "./adapter.ts";
 
@@ -24,6 +25,7 @@ export type FakeCall =
   | { method: "verifyIdentity" }
   | { method: "createContainer"; input: CreateContainerInput }
   | { method: "findService"; name: string }
+  | { method: "listServices" }
   | { method: "createDomain"; serviceId: string }
   | { method: "serviceDomain"; serviceId: string }
   | { method: "latestDeployment"; serviceId: string }
@@ -41,6 +43,7 @@ export type FakeMutation =
   | "redeployService"
   | "deleteService"
   | "findService"
+  | "listServices"
   | "verifyIdentity";
 
 export type FakeRailwayOptions = {
@@ -129,6 +132,31 @@ export class FakeRailway implements RailwayAdapter {
     for (const w of this.#watches.get(state.deploymentId) ?? []) w.onState({ ...state });
   }
 
+  /** Someone deletes the service from the Railway dashboard: the app makes no call and is not told. */
+  deleteOutsideApp(serviceId: string): void {
+    if (!this.#remove(serviceId)) throw new Error(`fake: no service ${serviceId}`);
+  }
+
+  /** Someone creates a service in the sandbox project by hand, with any name. Returns its id. */
+  addServiceOutsideApp(name: string): string {
+    const n = this.#nextId++;
+    const service: FakeService = { id: `svc-${n}`, name, image: "nginx:alpine", domain: null, deploymentId: `dep-${n}` };
+    this.services.set(service.id, service);
+    this.deployments.set(service.deploymentId, { deploymentId: service.deploymentId, status: "SUCCESS", stopped: false });
+    return service.id;
+  }
+
+  /** Delete a service; its deployment is removed and open subscriptions to it are told. False if there is none. */
+  #remove(serviceId: string): boolean {
+    const service = this.services.get(serviceId);
+    if (!service) return false;
+    this.services.delete(serviceId);
+    const removed: DeploymentState = { deploymentId: service.deploymentId, status: "REMOVED", stopped: false };
+    this.deployments.set(removed.deploymentId, removed);
+    for (const w of this.#watches.get(removed.deploymentId) ?? []) w.onState({ ...removed });
+    return true;
+  }
+
   /** Local development only: move a deployment on its own later, unless its service is gone by then. */
   #later(move: () => void): void {
     const ms = this.#options.autoSucceedAfterMs ?? 0;
@@ -211,14 +239,16 @@ export class FakeRailway implements RailwayAdapter {
     const failure = this.#failures.get("deleteService")?.shift();
     const early = failedBeforeActing(failure);
     if (early) return early;
-    const service = this.services.get(serviceId);
-    if (!service) return notFound("Service not found");
-    this.services.delete(serviceId);
-    const removed: DeploymentState = { deploymentId: service.deploymentId, status: "REMOVED", stopped: false };
-    this.deployments.set(removed.deploymentId, removed);
-    for (const w of this.#watches.get(removed.deploymentId) ?? []) w.onState({ ...removed });
+    if (!this.#remove(serviceId)) return notFound("Service not found");
     if (failure?.kind === "ambiguous_after_acting") return { kind: "ambiguous", reason: "fake: response lost" };
     return { kind: "ok", value: undefined };
+  }
+
+  async listServices(): Promise<Outcome<SandboxService[]>> {
+    this.calls.push({ method: "listServices" });
+    const early = failedBeforeActing(this.#failures.get("listServices")?.shift());
+    if (early) return early;
+    return { kind: "ok", value: [...this.services.values()].map((s) => ({ serviceId: s.id, name: s.name })) };
   }
 
   async findService(name: string): Promise<Outcome<CreatedService | null>> {

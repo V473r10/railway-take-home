@@ -286,4 +286,27 @@ describe("GraphqlRailway lookups after an ambiguous call", () => {
     const empty = adapterReturning(() => json({ data: { domains: { serviceDomains: [] } } }));
     expect(await empty.adapter.serviceDomain("svc-9")).toEqual({ kind: "ok", value: null });
   });
+
+  it("lists every service in the sandbox project, whoever created it", async () => {
+    const { adapter, captured } = adapterReturning(() =>
+      json({
+        data: {
+          project: {
+            services: { edges: [{ node: { id: "svc-1", name: "rcc-op-1" } }, { node: { id: "svc-7", name: "hand-made" } }] },
+          },
+        },
+      }),
+    );
+
+    expect(await adapter.listServices()).toEqual({
+      kind: "ok",
+      value: [
+        { serviceId: "svc-1", name: "rcc-op-1" },
+        { serviceId: "svc-7", name: "hand-made" },
+      ],
+    });
+    const body = JSON.parse(String(captured[0]!.init.body)) as { query: string; variables: unknown };
+    expect(body.query).toContain("project(id:$id)");
+    expect(body.variables).toEqual({ id: "proj-1" });
+  });
 });
