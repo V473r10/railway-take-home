@@ -3,9 +3,9 @@ import type { Clock } from "./clock.ts";
 import { type Db, transaction } from "./db.ts";
 import { Observer } from "./observer.ts";
 import { type Lookup, lookupFrom, withRetries } from "./retry.ts";
+import { type DeploymentPhase, phaseOf } from "./railway/deployment-phase.ts";
 import {
   CONTAINER_IMAGE,
-  DEPLOYMENT_FAILED_STATUSES,
   type DeploymentState,
   type Outcome,
   type PublicDomain,
@@ -81,8 +81,6 @@ export const MISSING_SWEEP_MS = 60 * 1000;
 /** After the observer sees a deployment go away: look again after 2, 4, 8 and 16 s. */
 export const SUSPECT_RECHECK_MIN_MS = 2_000;
 const SUSPECT_RECHECKS = 5;
-/** Observed statuses that mean the deployment is not serving. */
-const DOWN_STATUSES: ReadonlySet<string> = new Set(["CRASHED", "REMOVING", "REMOVED"]);
 export const MISSING_MESSAGE = "The service was deleted outside this app. Destroy the container to remove it.";
 // Serializes every create's count-then-insert, so concurrent creates cannot pass the limit together.
 const CREATE_LOCK = 7_202_605;
@@ -131,6 +129,11 @@ function isActive(status: OperationStatus | null): boolean {
   return status === "pending" || status === "in_progress";
 }
 
+/** The phase of the container's current deployment, or null before Railway reported it. */
+function observedPhase(row: ContainerRow): DeploymentPhase | null {
+  return row.observed_status === null ? null : phaseOf({ status: row.observed_status, stopped: row.observed_stopped === true });
+}
+
 /**
  * Container state as the user sees it: an active operation first, then a service
  * deleted outside the app, then the last failure, then what Railway reported. A crash
@@ -139,15 +142,18 @@ function isActive(status: OperationStatus | null): boolean {
 export function deriveState(row: ContainerRow): ContainerState {
   if (isActive(row.op_status) && row.op_kind) return TRANSITIONAL[row.op_kind];
   if (row.missing) return "missing";
+  const phase = observedPhase(row);
   // A deployment Railway is removing is down too: the service is usually being deleted,
   // which the missing sweep confirms shortly. Until then it is not "creating".
-  const crashed = row.observed_status !== null && DOWN_STATUSES.has(row.observed_status);
+  const down = phase === "down" || phase === "going-away";
   if (row.op_status === "failed") {
-    const crashedSince = crashed && row.observed_at !== null && row.op_updated_at !== null && row.observed_at > row.op_updated_at;
+    const crashedSince = down && row.observed_at !== null && row.op_updated_at !== null && row.observed_at > row.op_updated_at;
     return crashedSince ? "crashed" : "failed";
   }
-  if (row.observed_status === "SUCCESS") return row.observed_stopped ? "stopped" : "running";
-  if (crashed) return "crashed";
+  if (phase === "serving") return "running";
+  if (phase === "stopped") return "stopped";
+  if (down) return "crashed";
+  // Not reported yet, or Railway is still bringing it up without an operation of ours.
   return "creating";
 }
 
@@ -165,11 +171,22 @@ export function availability(row: ContainerRow, action: ContainerAction): Availa
   if (isActive(row.op_status) && row.op_kind) return refuse(`Wait for ${LABEL[row.op_kind]} to finish.`);
   if (row.missing) return refuse(MISSING_MESSAGE);
   if (!row.service_id) return refuse("This container has no Railway service.");
-  const running = row.observed_status === "SUCCESS" && row.observed_stopped === false;
-  if (action === "stop") return running ? { allowed: true } : refuse("Only a running container can be stopped.");
-  if (running) return refuse("The container is already running.");
-  if (row.observed_status === null) return refuse("Railway has not reported this container's deployment yet.");
-  return { allowed: true };
+  const phase = observedPhase(row);
+  if (action === "stop") return phase === "serving" ? { allowed: true } : refuse("Only a running container can be stopped.");
+  switch (phase) {
+    case null:
+      return refuse("Railway has not reported this container's deployment yet.");
+    case "serving":
+      return refuse("The container is already running.");
+    case "coming-up":
+      // Starting now would redeploy on top of the deployment Railway is still bringing up.
+      return refuse("Railway is still bringing this container up.");
+    case "going-away":
+      return refuse("Railway is removing this container's deployment.");
+    case "stopped":
+    case "down":
+      return { allowed: true };
+  }
 }
 
 function toView(row: ContainerRow, readOnly: ReadOnlyMode | null): ContainerView {
@@ -943,21 +960,22 @@ export class ContainerControl {
 
   /**
    * An operation completes when Railway is observed to reach what it asked for:
-   * Create and Start a running deployment, Stop a stopped one. Any of them fails
-   * if Railway gives up on the deployment.
+   * Create and Start a serving deployment, Stop a stopped one. Any of them fails
+   * once the deployment is down or going away, since it will not get there anymore.
    */
   async #onObserved(containerId: string, state: DeploymentState, changed: boolean): Promise<void> {
     const { db, clock } = this.#deps;
+    const phase = phaseOf(state, this.#deps.log);
     let settled = 0;
-    if (state.status === "SUCCESS") {
-      const kinds = state.stopped ? ["stop"] : ["create", "start"];
+    if (phase === "serving" || phase === "stopped") {
+      const kinds = phase === "stopped" ? ["stop"] : ["create", "start"];
       const result = await db.query(
         `UPDATE operations SET status = 'succeeded', updated_at = $2
          WHERE container_id = $1 AND kind = ANY($3) AND status = 'in_progress'`,
         [containerId, clock.now(), kinds],
       );
       settled = result.rowCount ?? 0;
-    } else if (DEPLOYMENT_FAILED_STATUSES.has(state.status)) {
+    } else if (phase === "down" || phase === "going-away") {
       const result = await db.query(
         `UPDATE operations SET status = 'failed', last_error = $2, updated_at = $3
          WHERE container_id = $1 AND kind IN ('create', 'start', 'stop') AND status = 'in_progress'`,

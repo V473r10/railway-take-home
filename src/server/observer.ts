@@ -1,6 +1,7 @@
 import type { Clock } from "./clock.ts";
 import type { Db } from "./db.ts";
 import type { DeploymentState, RailwayAdapter } from "./railway/adapter.ts";
+import { phaseOf } from "./railway/deployment-phase.ts";
 
 /** Fallback backoff: after a subscription ends, wait this long before reading again and resubscribing. */
 export const MIN_BACKOFF_MS = 2_000;
@@ -69,8 +70,8 @@ export class Observer {
   }
 
   /**
-   * Read a deployment until Railway reports it stopped (or no longer SUCCESS), storing
-   * each read as a push would. Needed because subscriptions push `status` changes only:
+   * Read a deployment until Railway reports it is no longer serving (stopped, or down),
+   * storing each read as a push would. Needed because subscriptions push `status` changes only:
    * a stop leaves the status at SUCCESS and flips `deploymentStopped`, which Railway
    * never pushes (measured in the deploy smoke, #12). The first read is immediate; then
    * it backs off, and ends once `stillWanted` says no, or the container is untracked.
@@ -88,7 +89,7 @@ export class Observer {
         if (signal.aborted) return;
         if (outcome.kind === "ok") {
           await this.#store(containerId, outcome.value);
-          if (outcome.value.stopped || outcome.value.status !== "SUCCESS") return;
+          if (phaseOf(outcome.value, this.#deps.log) !== "serving") return;
         }
         if (!(await stillWanted())) return;
         await this.#deps.clock.sleep(outcome.kind === "rate_limited" ? outcome.retryAfterMs : wait, signal);
@@ -208,7 +209,7 @@ export class Observer {
   }
 
   async #store(containerId: string, state: DeploymentState): Promise<void> {
-    if (state.status === "REMOVED" || state.status === "REMOVING") this.#deps.onSuspectGone(containerId);
+    if (phaseOf(state, this.#deps.log) === "going-away") this.#deps.onSuspectGone(containerId);
     // Only the current deployment's state counts; a late event from an older deployment is dropped.
     // `observed_at` is when the observed state last changed, so it can be compared with a failure.
     const { rows } = await this.#deps.db.query<{ changed: boolean }>(

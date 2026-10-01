@@ -28,7 +28,8 @@ export type PublicDomain = { domain: string };
 /**
  * What Railway reports for one deployment. `status` is Railway's DeploymentStatus
  * (SUCCESS, DEPLOYING, CRASHED, ...). A stopped deployment keeps `status: SUCCESS`
- * and sets `stopped`, so the two are only meaningful together (M0 spike).
+ * and sets `stopped`, so the two are only meaningful together (M0 spike). What they
+ * mean for a container is `phaseOf` (deployment-phase.ts); nothing else reads `status`.
  */
 export type DeploymentState = { deploymentId: string; status: string; stopped: boolean };
 
@@ -84,9 +85,6 @@ export const CONTAINER_IMAGE = "nginx:alpine";
 
 /** The port `CONTAINER_IMAGE` listens on; the public domain routes to it. */
 export const CONTAINER_PORT = 80;
-
-/** Deployment statuses after which Railway will not move the deployment on its own. */
-export const DEPLOYMENT_FAILED_STATUSES: ReadonlySet<string> = new Set(["FAILED", "CRASHED", "REMOVED", "SKIPPED"]);
 
 export function serviceNameFor(createOperationId: string): string {
   return `${SERVICE_NAME_PREFIX}${createOperationId}`;
