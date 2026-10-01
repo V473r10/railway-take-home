@@ -78,6 +78,11 @@ export const LIFETIME_SWEEP_MS = 60 * 1000;
 export const CONTAINER_LIMIT_MESSAGE = `The limit of ${CONTAINER_LIMIT} containers is reached (stopped ones count). Destroy one to create another.`;
 /** How often the app checks that every container's service still exists, besides once at startup. */
 export const MISSING_SWEEP_MS = 60 * 1000;
+/** After the observer sees a deployment go away: look again after 2, 4, 8 and 16 s. */
+export const SUSPECT_RECHECK_MIN_MS = 2_000;
+const SUSPECT_RECHECKS = 5;
+/** Observed statuses that mean the deployment is not serving. */
+const DOWN_STATUSES: ReadonlySet<string> = new Set(["CRASHED", "REMOVING", "REMOVED"]);
 export const MISSING_MESSAGE = "The service was deleted outside this app. Destroy the container to remove it.";
 // Serializes every create's count-then-insert, so concurrent creates cannot pass the limit together.
 const CREATE_LOCK = 7_202_605;
@@ -134,7 +139,9 @@ function isActive(status: OperationStatus | null): boolean {
 export function deriveState(row: ContainerRow): ContainerState {
   if (isActive(row.op_status) && row.op_kind) return TRANSITIONAL[row.op_kind];
   if (row.missing) return "missing";
-  const crashed = row.observed_status === "CRASHED";
+  // A deployment Railway is removing is down too: the service is usually being deleted,
+  // which the missing sweep confirms shortly. Until then it is not "creating".
+  const crashed = row.observed_status !== null && DOWN_STATUSES.has(row.observed_status);
   if (row.op_status === "failed") {
     const crashedSince = crashed && row.observed_at !== null && row.op_updated_at !== null && row.observed_at > row.op_updated_at;
     return crashedSince ? "crashed" : "failed";
@@ -247,7 +254,9 @@ export class ContainerControl {
   /** Per container, the drive in flight for it, so a Destroy can interrupt it and wait for it. */
   readonly #drives = new Map<string, { done: Promise<void>; abort: AbortController }>();
   #readOnly: ReadOnlyMode | null = null;
-  readonly #missingSweep = { running: false, again: false };
+  readonly #missingSweep: { done: Promise<void> | null; again: boolean } = { done: null, again: false };
+  /** Containers whose deployment the observer saw go away, being re-checked. */
+  readonly #suspects = new Set<string>();
 
   constructor(deps: ContainerControlDeps) {
     this.#deps = deps;
@@ -257,7 +266,7 @@ export class ContainerControl {
       clock: deps.clock,
       log: deps.log ?? console.error,
       onObserved: (id, state, changed) => this.#onObserved(id, state, changed),
-      onSuspectGone: () => this.#checkMissing(),
+      onSuspectGone: (id) => this.#suspectGone(id),
     });
   }
 
@@ -318,27 +327,57 @@ export class ContainerControl {
    * runs in read-only mode too.
    */
   #startMissingSweep(): void {
-    this.#deps.clock.every(MISSING_SWEEP_MS, () => this.#checkMissing(), this.#closing.signal);
+    this.#deps.clock.every(MISSING_SWEEP_MS, () => void this.#checkMissing(), this.#closing.signal);
   }
 
   /** Run the missing sweep, or once more after the one running now: its listing may predate the suspicion. */
-  #checkMissing(): void {
+  #checkMissing(): Promise<void> {
     const sweep = this.#missingSweep;
-    if (this.#closing.signal.aborted) return;
-    if (sweep.running) {
+    if (this.#closing.signal.aborted) return Promise.resolve();
+    if (sweep.done) {
       sweep.again = true;
-      return;
+      return sweep.done;
     }
-    sweep.running = true;
     const run = async () => {
       do {
         sweep.again = false;
         await this.#sweepMissing();
       } while (sweep.again && !this.#closing.signal.aborted);
     };
-    void this.#track(run()).finally(() => {
-      sweep.running = false;
+    sweep.done = this.#track(run()).finally(() => {
+      sweep.done = null;
     });
+    return sweep.done;
+  }
+
+  /**
+   * The observer saw the deployment go away. Railway deletes a service asynchronously,
+   * so the listing right after can still show it; look again with backoff for a short
+   * while instead of leaving it to the next minute's sweep. Not tracked: a pending
+   * re-check is not work `settled()` should wait for, and it ends with the process.
+   */
+  #suspectGone(containerId: string): void {
+    if (this.#suspects.has(containerId)) return;
+    this.#suspects.add(containerId);
+    const { db, clock } = this.#deps;
+    const recheck = async () => {
+      let backoff = SUSPECT_RECHECK_MIN_MS;
+      for (let i = 0; i < SUSPECT_RECHECKS; i++) {
+        await this.#checkMissing();
+        const { rowCount } = await db.query(
+          `SELECT 1 FROM containers c WHERE c.id = $1 AND c.destroyed_at IS NULL AND c.missing_at IS NULL
+             AND NOT EXISTS (SELECT 1 FROM operations o WHERE o.container_id = c.id AND o.kind = 'destroy'
+                             AND o.status IN ('pending', 'in_progress'))`,
+          [containerId],
+        );
+        if (!rowCount || i === SUSPECT_RECHECKS - 1) return;
+        await clock.sleep(backoff, this.#closing.signal);
+        backoff *= 2;
+      }
+    };
+    void recheck()
+      .catch(() => {})
+      .finally(() => this.#suspects.delete(containerId));
   }
 
   /**

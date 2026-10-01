@@ -98,6 +98,11 @@ Open `test/retries.test.ts` and show two:
 Then the reason for the fake: "these failures cannot be provoked on demand against real
 Railway, and each try would spend the rate limit."
 
+One failure can be shown live: with a container running, delete its service from the
+sandbox in Railway's dashboard. The app shows it down at once and `missing` a few
+seconds later (3.8 s in the rehearsal), with Stop and Start refused and Destroy
+available. Destroy only closes the row; nothing is re-created.
+
 ## 6. The bug the fake could not find (3 min)
 
 The first smoke against real Railway stalled at Stop: the subscription pushes only
@@ -117,7 +122,7 @@ the fix exercised the reconciler for real: it resumed the stuck Stop and complet
 ## 8. Limits and extensions (3 min, then questions)
 
 From the ERD: one instance only; a repeated Start can produce one extra deployment,
-never an extra service; `missing` is not yet observed against real Railway. Extensions:
+never an extra service. Extensions:
 Login with Railway (OAuth) and per-user containers, a project-scoped token, the
 deployment step timeline, `deploymentCancel`.
 

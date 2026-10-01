@@ -35,12 +35,19 @@ Variables of the app service:
 | `DATABASE_URL` | A reference to `${{Postgres.DATABASE_URL}}`. |
 
 The token is used by the server only; the browser never receives it. Migrations run at
-startup, under an advisory lock. `railway.json` sets the health check (`/api/health`),
-the restart policy and the start command. The start command runs `node` directly, not
-`npm start`: npm reports the SIGTERM of a stop as a failure, so a clean stop showed up
-as `CRASHED`.
+startup, under an advisory lock. The service's health check (`/api/health`), restart
+policy and start command are set through the API with
+`node scripts/railway-power.mjs configure`: Railway ignores `railway.json` for this
+service. The start command runs `node` directly, not `npm start`: npm reports the
+SIGTERM of a stop as a failure, so a clean stop showed up as `CRASHED`.
 
-Deployed with the Railway CLI: `railway up --service app` from the repository root.
+Deployed with the Railway CLI from the repository root. With an account token the CLI
+reads it from `RAILWAY_API_TOKEN` (`RAILWAY_TOKEN` is for project tokens) and needs the
+ids spelled out:
+
+```sh
+RAILWAY_API_TOKEN=... railway up -p <app project id> -s <app service id> -e <environment id> --ci
+```
 
 Between demos the app and its Postgres are paused, so they do not spend plan credit
 (Serverless sleep would never trigger: the minute sweeps and the database connection
@@ -50,6 +57,7 @@ are outbound traffic). The Postgres volume is kept.
 RAILWAY_TOKEN=... SANDBOX_PROJECT_ID=... node scripts/railway-power.mjs pause    # app, then Postgres
 RAILWAY_TOKEN=... node scripts/railway-power.mjs resume                           # Postgres, then app (~70 s)
 RAILWAY_TOKEN=... node scripts/railway-power.mjs status
+RAILWAY_TOKEN=... node scripts/railway-power.mjs configure                        # deploy settings, then redeploy
 ```
 
 `pause` refuses while the sandbox still has services, since nothing enforces their
@@ -95,3 +103,18 @@ for real: it resumed the stuck Stop, read the deployment and completed it.
 | Stop | 202, `stopped` after 3 s |
 | Start | 202, `running` again after 7 s on a new deployment |
 | Destroy | 202, gone after 3 s; the sandbox project is empty afterwards |
+
+**2026-10-01, walkthrough rehearsal: passed 15/15 after two fixes.** A script followed
+`docs/walkthrough.md`. The first pass found that a service deleted from outside took
+54 s to show `missing` and showed `creating` meanwhile, and that Railway was ignoring
+`railway.json` (no health check, `npm start`). Both fixed (see the ERD); the second pass:
+
+| Step | Result |
+| --- | --- |
+| Double click on Create | one operation (202 and 200) |
+| Create | `running` after 9 s; public URL 200 |
+| Stop / Start | `stopped` after 3 s, `running` after 6 s |
+| Create, then restart the app mid-create | the new process reconciled it; `running` 7 s later; 2 services in the sandbox, no duplicate |
+| Delete a service from outside the app | `crashed` at once, `missing` after 3.8 s; Destroy then closes it |
+| Destroy both | sandbox empty |
+| Pause | app `SUCCESS (stopped)`, no longer `CRASHED` |

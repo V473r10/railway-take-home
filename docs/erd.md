@@ -153,6 +153,14 @@ down after running shows `crashed` (Railway's fault, not the request's, which is
 every minute and when the observer suspects a deletion. The observer alone cannot tell a
 deletion from a Railway blip, so nothing is concluded without a successful list.
 
+**Found by the rehearsal on real Railway:** after a deletion the deployment reports
+removed at once, but Railway keeps listing the service for a few seconds. The suspicion
+sweep saw it still listed and concluded nothing, so `missing` waited for the minute
+sweep (54 s), and meanwhile a removed deployment fell through the state derivation as
+`creating`. Now a suspicion is re-checked after 2, 4, 8 and 16 s, and a removed
+deployment shows as down (`crashed`) until confirmed: `missing` appeared 3.8 s after
+the deletion.
+
 ### The app owns only what it created
 
 A sandbox service belongs to the app only if it has a row in `containers`. The `rcc-`
@@ -258,13 +266,15 @@ its first run found the Stop bug above.
 
 - A Start whose redeploy acted but whose new deployment Railway does not list yet can be
   repeated: one extra deployment, never an extra service.
-- Deleting a service from Railway's dashboard (`missing`) is covered by tests against the
-  fake but has not been observed against real Railway.
 - One instance only (ADR 0001).
 - The app is deployed with `railway up`; Railway's GitHub app has no access to the
   repository, so a merge does not redeploy.
-- `railway.json` is deprecated by Railway in favour of a newer config format, supported
-  until 2026-12-01.
+- Railway ignored `railway.json` for this service (Config as Code is deprecated and new
+  services cannot opt in), so the health check and start command were never applied
+  until the rehearsal found it. They are now set through the API by
+  `scripts/railway-power.mjs configure`, and the file is gone.
+- `destroy.test.ts` has a rare flake (about 1 run in 50, on `main` too), not yet
+  diagnosed.
 
 ## Out of scope, and the obvious extensions
 

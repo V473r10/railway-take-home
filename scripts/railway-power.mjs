@@ -2,7 +2,7 @@
 // Pause or resume the deployed app and its Postgres, so they don't burn
 // plan credit between demos.
 //
-//   RAILWAY_TOKEN=... SANDBOX_PROJECT_ID=... node scripts/railway-power.mjs pause|resume|restart|status
+//   RAILWAY_TOKEN=... SANDBOX_PROJECT_ID=... node scripts/railway-power.mjs pause|resume|restart|configure|status
 //
 // pause:  refuses while the sandbox still has services (nothing would enforce
 //         their lifetime with the app down), then stops app, then Postgres.
@@ -18,8 +18,8 @@ const token = process.env.RAILWAY_TOKEN;
 const sandboxId = process.env.SANDBOX_PROJECT_ID;
 const command = process.argv[2];
 
-if (!token || !["pause", "resume", "restart", "status"].includes(command)) {
-  console.error("usage: RAILWAY_TOKEN=... [SANDBOX_PROJECT_ID=...] node scripts/railway-power.mjs pause|resume|restart|status");
+if (!token || !["pause", "resume", "restart", "configure", "status"].includes(command)) {
+  console.error("usage: RAILWAY_TOKEN=... [SANDBOX_PROJECT_ID=...] node scripts/railway-power.mjs pause|resume|restart|configure|status");
   process.exit(2);
 }
 
@@ -114,6 +114,35 @@ async function resume() {
   }
 }
 
+// The app service's deploy settings. Railway ignores railway.json for services created
+// after Config as Code was deprecated, so they are applied through the API instead.
+const APP_SETTINGS = {
+  // node directly: npm reports the SIGTERM of a stop as a failure, so a clean stop showed as CRASHED.
+  startCommand: "node src/server/main.ts",
+  healthcheckPath: "/api/health",
+  healthcheckTimeout: 120,
+  restartPolicyType: "ON_FAILURE",
+  restartPolicyMaxRetries: 10,
+};
+
+// Write the settings, then redeploy: a running deployment keeps the settings it started with.
+async function configure() {
+  const s = byName(await services(), "app");
+  await gql(`mutation($s: String!, $e: String!, $input: ServiceInstanceUpdateInput!) {
+      serviceInstanceUpdate(serviceId: $s, environmentId: $e, input: $input) }`, {
+    s: s.id,
+    e: s.environmentId,
+    input: APP_SETTINGS,
+  });
+  console.log(`app: settings written (${Object.keys(APP_SETTINGS).join(", ")}); redeploying`);
+  await gql(`mutation($s: String!, $e: String!) { serviceInstanceRedeploy(serviceId: $s, environmentId: $e) }`, {
+    s: s.id,
+    e: s.environmentId,
+  });
+  await waitFor("app", (x) => isUp(x) && x.deployment.id !== s.deployment?.id, 300_000);
+  console.log("app: running with the new settings");
+}
+
 // Restart the app's process in place, for the walkthrough's "kill it mid-create" demo.
 async function restart() {
   const s = byName(await services(), "app");
@@ -124,6 +153,7 @@ async function restart() {
 
 try {
   if (command === "restart") await restart();
+  if (command === "configure") await configure();
   if (command === "pause") await pause();
   if (command === "resume") await resume();
   for (const s of await services()) console.log(describe(s));

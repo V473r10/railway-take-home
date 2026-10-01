@@ -61,6 +61,8 @@ export class FakeRailway implements RailwayAdapter {
   readonly services = new Map<string, FakeService>();
   readonly deployments = new Map<string, DeploymentState>();
   readonly #options: FakeRailwayOptions;
+  /** Services deleted from outside that Railway still lists, for this many more listings. */
+  readonly #stillListed = new Map<string, { name: string; calls: number }>();
   #failures = new Map<FakeMutation, InjectedFailure[]>();
   #staleLatest = 0;
   /** Per service, the deployment its last redeploy replaced (what a lagging list still shows). */
@@ -138,9 +140,15 @@ export class FakeRailway implements RailwayAdapter {
     for (const w of this.#watches.get(state.deploymentId) ?? []) w.onState({ ...state });
   }
 
-  /** Someone deletes the service from the Railway dashboard: the app makes no call and is not told. */
-  deleteOutsideApp(serviceId: string): void {
-    if (!this.#remove(serviceId)) throw new Error(`fake: no service ${serviceId}`);
+  /**
+   * Someone deletes the service from the Railway dashboard: the app makes no call and is not told.
+   * With `listedFor`, Railway keeps listing the service for that many more `listServices`
+   * calls after its deployment reports REMOVED, as seen against real Railway.
+   */
+  deleteOutsideApp(serviceId: string, options: { listedFor?: number } = {}): void {
+    const service = this.services.get(serviceId);
+    if (!this.#remove(serviceId) || !service) throw new Error(`fake: no service ${serviceId}`);
+    if (options.listedFor) this.#stillListed.set(serviceId, { name: service.name, calls: options.listedFor });
   }
 
   /** Someone creates a service in the sandbox project by hand, with any name. Returns its id. */
@@ -254,7 +262,11 @@ export class FakeRailway implements RailwayAdapter {
     this.calls.push({ method: "listServices" });
     const early = failedBeforeActing(this.#failures.get("listServices")?.shift());
     if (early) return early;
-    return { kind: "ok", value: [...this.services.values()].map((s) => ({ serviceId: s.id, name: s.name })) };
+    const lingering = [...this.#stillListed].map(([serviceId, entry]) => {
+      if (--entry.calls <= 0) this.#stillListed.delete(serviceId);
+      return { serviceId, name: entry.name };
+    });
+    return { kind: "ok", value: [...[...this.services.values()].map((s) => ({ serviceId: s.id, name: s.name })), ...lingering] };
   }
 
   async findService(name: string): Promise<Outcome<CreatedService | null>> {
