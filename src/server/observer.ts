@@ -208,7 +208,7 @@ export class Observer {
   }
 
   async #store(containerId: string, state: DeploymentState): Promise<void> {
-    if (state.status === "REMOVED") this.#deps.onSuspectGone(containerId);
+    if (state.status === "REMOVED" || state.status === "REMOVING") this.#deps.onSuspectGone(containerId);
     // Only the current deployment's state counts; a late event from an older deployment is dropped.
     // `observed_at` is when the observed state last changed, so it can be compared with a failure.
     const { rows } = await this.#deps.db.query<{ changed: boolean }>(

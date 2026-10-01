@@ -1,5 +1,5 @@
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
-import { CONTAINER_LIFETIME_MS, MISSING_MESSAGE, MISSING_SWEEP_MS } from "../src/server/containers.ts";
+import { CONTAINER_LIFETIME_MS, MISSING_MESSAGE, MISSING_SWEEP_MS, SUSPECT_RECHECK_MIN_MS } from "../src/server/containers.ts";
 import { SERVICE_NAME_PREFIX } from "../src/server/railway/adapter.ts";
 import { action, type ContainerBody, type CreateBody, create, eventually, type Harness, list, startHarness } from "./harness.ts";
 
@@ -75,6 +75,26 @@ describe("crashed", () => {
 });
 
 describe("missing", () => {
+  it("re-checks soon when Railway still lists a service whose deployment it removed", async () => {
+    const { id, serviceId } = await running();
+    // As on real Railway: the deployment reports REMOVED, the listing lags behind.
+    h.railway.deleteOutsideApp(serviceId, { listedFor: 2 });
+
+    // Down, not "creating", while the deletion is being confirmed.
+    await eventually(async () => (await find(id))?.state === "crashed");
+    await eventually(() => h.clock.sleepers === 1);
+    expect((await find(id))?.state).toBe("crashed");
+
+    // Well before the minute's sweep: 2 s, then 4 s.
+    const listings = h.railway.callsTo("listServices").length;
+    h.clock.advance(SUSPECT_RECHECK_MIN_MS);
+    await eventually(() => h.railway.callsTo("listServices").length === listings + 1 && h.clock.sleepers === 1);
+    expect((await find(id))?.state).toBe("crashed");
+    h.clock.advance(SUSPECT_RECHECK_MIN_MS * 2);
+    await eventually(async () => (await find(id))?.state === "missing");
+    expect(h.clock.sleepers).toBe(0);
+  });
+
   it("shows missing once the service is deleted outside the app, and only reads Railway", async () => {
     const { id, serviceId } = await running();
     h.railway.deleteOutsideApp(serviceId);
