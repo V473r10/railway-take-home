@@ -2,8 +2,15 @@
 
 A small app that spins `nginx:alpine` containers up and down on Railway through its
 public GraphQL API: create, stop, start and destroy, with live state in the browser.
-The spec is [issue #1](https://github.com/V473r10/railway-take-home/issues/1); the
-vocabulary is in [CONTEXT.md](CONTEXT.md) and the decisions in [docs/adr](docs/adr).
+A double click, a lost response, a restart mid-create or a service deleted by hand never
+leave a duplicate or an orphan, and the screen shows what Railway actually has.
+
+- [docs/erd.md](docs/erd.md): every decision, the alternative rejected and why.
+- [docs/walkthrough.md](docs/walkthrough.md): the 30-minute demo script, including the
+  failure demo.
+- [docs/adr](docs/adr): the four decisions with lasting weight;
+  [CONTEXT.md](CONTEXT.md): the vocabulary; [issue #1](https://github.com/V473r10/railway-take-home/issues/1):
+  the spec.
 
 ## Deployment
 
@@ -28,22 +35,42 @@ Variables of the app service:
 | `DATABASE_URL` | A reference to `${{Postgres.DATABASE_URL}}`. |
 
 The token is used by the server only; the browser never receives it. Migrations run at
-startup, under an advisory lock. `railway.json` sets the health check (`/api/health`)
-and the restart policy.
+startup, under an advisory lock. `railway.json` sets the health check (`/api/health`),
+the restart policy and the start command. The start command runs `node` directly, not
+`npm start`: npm reports the SIGTERM of a stop as a failure, so a clean stop showed up
+as `CRASHED`.
 
 Deployed with the Railway CLI: `railway up --service app` from the repository root.
 
+Between demos the app and its Postgres are paused, so they do not spend plan credit
+(Serverless sleep would never trigger: the minute sweeps and the database connection
+are outbound traffic). The Postgres volume is kept.
+
+```sh
+RAILWAY_TOKEN=... SANDBOX_PROJECT_ID=... node scripts/railway-power.mjs pause    # app, then Postgres
+RAILWAY_TOKEN=... node scripts/railway-power.mjs resume                           # Postgres, then app (~70 s)
+RAILWAY_TOKEN=... node scripts/railway-power.mjs status
+```
+
+`pause` refuses while the sandbox still has services, since nothing enforces their
+lifetime with the app down; on resume, the boot sweep destroys whatever expired.
+`restart` restarts the app's process in place, for the walkthrough's failure demo.
+
 ## Development
 
-Node 24 or newer, and a Postgres for the tests.
+Node 24 or newer, and a Postgres for the tests (CI uses a Postgres service).
 
 ```sh
 npm ci
 npm run test:local                 # starts a throwaway Postgres in .scratch/, then runs the suite
+npx vitest run test/reconcile.test.ts   # one file, once the cluster is up (scripts/test-db.sh)
+npm run typecheck && npm run build
 RAILWAY_FAKE=1 DATABASE_URL=... APP_PASSWORD=... SESSION_SECRET=... npm run dev
 ```
 
-`RAILWAY_FAKE=1` swaps Railway for the same in-memory fake the tests use.
+`RAILWAY_FAKE=1` swaps Railway for the same in-memory fake the tests use, with
+deployments that succeed on their own after 1.5 s, so the UI can be used end to end
+without a token. Tests read `TEST_DATABASE_URL` and default to the throwaway cluster.
 
 ## Smoke test against real Railway
 
