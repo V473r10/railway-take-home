@@ -5,6 +5,8 @@ import type { DeploymentState, RailwayAdapter } from "./railway/adapter.ts";
 /** Fallback backoff: after a subscription ends, wait this long before reading again and resubscribing. */
 export const MIN_BACKOFF_MS = 2_000;
 export const MAX_BACKOFF_MS = 60_000;
+/** A Stop is confirmed by reading: first again after this long, doubling up to MAX_BACKOFF_MS. */
+export const STOP_CONFIRM_MIN_MS = 2_000;
 
 export type ObserverDeps = {
   db: Db;
@@ -31,6 +33,7 @@ export type ObserverDeps = {
 export class Observer {
   readonly #deps: ObserverDeps;
   readonly #watching = new Map<string, AbortController>();
+  readonly #confirming = new Map<string, AbortController>();
   readonly #tasks = new Set<Promise<void>>();
   #closed = false;
 
@@ -65,13 +68,52 @@ export class Observer {
     });
   }
 
+  /**
+   * Read a deployment until Railway reports it stopped (or no longer SUCCESS), storing
+   * each read as a push would. Needed because subscriptions push `status` changes only:
+   * a stop leaves the status at SUCCESS and flips `deploymentStopped`, which Railway
+   * never pushes (measured in the deploy smoke, #12). The first read is immediate; then
+   * it backs off, and ends once `stillWanted` says no, or the container is untracked.
+   */
+  confirmStopped(containerId: string, deploymentId: string, stillWanted: () => Promise<boolean>): void {
+    if (this.#closed) return;
+    this.#confirming.get(containerId)?.abort();
+    const controller = new AbortController();
+    this.#confirming.set(containerId, controller);
+    const { signal } = controller;
+    const run = async () => {
+      let wait = STOP_CONFIRM_MIN_MS;
+      while (!signal.aborted) {
+        const outcome = await this.#deps.railway.readDeployment(deploymentId);
+        if (signal.aborted) return;
+        if (outcome.kind === "ok") {
+          await this.#store(containerId, outcome.value);
+          if (outcome.value.stopped || outcome.value.status !== "SUCCESS") return;
+        }
+        if (!(await stillWanted())) return;
+        await this.#deps.clock.sleep(outcome.kind === "rate_limited" ? outcome.retryAfterMs : wait, signal);
+        wait = Math.min(wait * 2, MAX_BACKOFF_MS);
+      }
+    };
+    const task = run().catch((error: unknown) => {
+      if (!signal.aborted) this.#deps.log(`observer: confirming stop of ${deploymentId}: ${String(error)}`);
+    });
+    this.#tasks.add(task);
+    void task.finally(() => {
+      this.#tasks.delete(task);
+      if (this.#confirming.get(containerId) === controller) this.#confirming.delete(containerId);
+    });
+  }
+
   untrack(containerId: string): void {
+    this.#confirming.get(containerId)?.abort();
     this.#watching.get(containerId)?.abort();
   }
 
   async close(): Promise<void> {
     this.#closed = true;
     for (const controller of this.#watching.values()) controller.abort();
+    for (const controller of this.#confirming.values()) controller.abort();
     while (this.#tasks.size > 0) await Promise.all(this.#tasks);
   }
 

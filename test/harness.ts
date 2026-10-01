@@ -7,6 +7,7 @@ import { createApp } from "../src/server/app.ts";
 import { type Clock, ManualClock } from "../src/server/clock.ts";
 import { ContainerControl } from "../src/server/containers.ts";
 import { connect, type Db, migrate } from "../src/server/db.ts";
+import { STOP_CONFIRM_MIN_MS } from "../src/server/observer.ts";
 import type { CreateContainerInput, DeploymentWatch, RailwayAdapter } from "../src/server/railway/adapter.ts";
 import { type FakeCall, type FakeMutation, FakeRailway } from "../src/server/railway/fake.ts";
 
@@ -343,6 +344,22 @@ export async function openEventStream(res: Response): Promise<EventStream> {
       await pump;
     },
   };
+}
+
+/**
+ * Railway finishes stopping a service's deployment. Like the real API, the fake does
+ * not push that (only status changes are pushed), so the observer finds out by reading
+ * with backoff: move the clock until it has read again.
+ */
+export async function railwayStops(h: Harness, serviceId: string): Promise<void> {
+  const reads = () => h.railway.callsTo("readDeployment").length;
+  h.railway.setDeployment(serviceId, "SUCCESS", true);
+  const before = reads();
+  await eventually(() => {
+    if (reads() > before) return true;
+    if (h.clock.sleepers > 0) h.clock.advance(STOP_CONFIRM_MIN_MS);
+    return false;
+  });
 }
 
 /** Poll a condition that becomes true asynchronously (the observer runs in the background). */

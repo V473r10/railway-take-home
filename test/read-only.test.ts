@@ -1,6 +1,6 @@
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import type { FakeMutation, InjectedFailure } from "../src/server/railway/fake.ts";
-import { type ContainerBody, type CreateBody, action, create, eventually, type Harness, list, startHarness } from "./harness.ts";
+import { type ContainerBody, type CreateBody, action, create, eventually, type Harness, list, startHarness, railwayStops } from "./harness.ts";
 
 let h: Harness;
 beforeEach(async () => {
@@ -50,7 +50,7 @@ describe("identity check at startup", () => {
     const { id, serviceId } = await running();
     expect((await action(h, id, "stop")).status).toBe(202);
     await h.settled();
-    h.railway.setDeployment(serviceId, "SUCCESS", true);
+    await railwayStops(h, serviceId);
     await eventually(async () => (await stateOf(id)) === "stopped");
     expect((await action(h, id, "start")).status).toBe(202);
     await h.settled();
@@ -81,7 +81,7 @@ describe("read-only mode", () => {
     const down = await running();
     await action(h, down.id, "stop");
     await h.settled();
-    h.railway.setDeployment(down.serviceId, "SUCCESS", true);
+    await railwayStops(h, down.serviceId);
     await eventually(async () => (await stateOf(down.id)) === "stopped");
 
     await h.restart((railway) => railway.failNextOn("verifyIdentity", { kind: "rejected", message: "Not Authorized" }));

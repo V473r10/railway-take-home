@@ -1,7 +1,7 @@
 import { setTimeout as pause } from "node:timers/promises";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import { MAX_ATTEMPTS } from "../src/server/retry.ts";
-import { action, type CreateBody, create, eventually, type Harness, list, startHarness } from "./harness.ts";
+import { action, type CreateBody, create, eventually, type Harness, list, startHarness, railwayStops } from "./harness.ts";
 
 let h: Harness;
 beforeEach(async () => {
@@ -196,7 +196,7 @@ describe("retries of the other calls", () => {
     await h.settled();
     expect(h.railway.callsTo("stopDeployment")).toHaveLength(2);
 
-    h.railway.setDeployment(serviceId, "SUCCESS", true);
+    await railwayStops(h, serviceId);
     await eventually(async () => (await list(h))[0]?.state === "stopped");
   });
 
@@ -204,7 +204,7 @@ describe("retries of the other calls", () => {
     const { id, serviceId } = await running();
     await action(h, id, "stop");
     await h.settled();
-    h.railway.setDeployment(serviceId, "SUCCESS", true);
+    await railwayStops(h, serviceId);
     await eventually(async () => (await list(h))[0]?.state === "stopped");
 
     h.railway.failNextOn("redeployService", { kind: "ambiguous_after_acting" });

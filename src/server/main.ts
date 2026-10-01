@@ -50,9 +50,10 @@ await control.start();
 const app = createApp({ control, gate, webRoot: join(import.meta.dirname, "..", "..", "dist", "web") });
 
 const port = Number(process.env.PORT ?? 3000);
-const server = serve({ fetch: app.fetch, port, hostname: process.env.HOST ?? "127.0.0.1" }, () =>
-  console.log(`listening on ${process.env.HOST ?? "127.0.0.1"}:${port}`),
-);
+// Railway's proxy and health check reach the container from outside, so there the
+// server listens on every interface ("::" covers IPv4 too); locally it stays on loopback.
+const hostname = process.env.HOST ?? (process.env.RAILWAY_ENVIRONMENT === undefined ? "127.0.0.1" : "::");
+const server = serve({ fetch: app.fetch, port, hostname }, () => console.log(`listening on ${hostname}:${port}`));
 
 for (const signal of ["SIGINT", "SIGTERM"] as const) {
   process.once(signal, () => {

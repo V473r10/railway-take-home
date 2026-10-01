@@ -123,12 +123,18 @@ export class FakeRailway implements RailwayAdapter {
     return [...this.#watches.values()].reduce((n, set) => n + set.size, 0);
   }
 
-  /** Railway moves the service's current deployment; open subscriptions to it are told. */
+  /**
+   * Railway moves the service's current deployment. Like Railway's subscription,
+   * open subscriptions are told only when the status changes: a stop that leaves the
+   * status at SUCCESS and flips `stopped` is not pushed (measured in the deploy smoke, #12).
+   */
   setDeployment(serviceId: string, status: string, stopped = false): void {
     const service = this.services.get(serviceId);
     if (!service) throw new Error(`fake: no service ${serviceId}`);
     const state: DeploymentState = { deploymentId: service.deploymentId, status, stopped };
+    const before = this.deployments.get(state.deploymentId);
     this.deployments.set(state.deploymentId, state);
+    if (before?.status === status) return;
     for (const w of this.#watches.get(state.deploymentId) ?? []) w.onState({ ...state });
   }
 

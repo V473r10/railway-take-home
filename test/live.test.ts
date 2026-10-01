@@ -1,6 +1,6 @@
 import { afterEach, describe, expect, it } from "vitest";
 import { MIN_BACKOFF_MS } from "../src/server/observer.ts";
-import { type ContainerBody, type CreateBody, create, eventually, type Harness, type LiveEvent, list, startHarness } from "./harness.ts";
+import { action, type ContainerBody, type CreateBody, create, eventually, type Harness, type LiveEvent, list, railwayStops, startHarness } from "./harness.ts";
 
 const harnesses: Harness[] = [];
 async function harness(): Promise<Harness> {
@@ -116,14 +116,18 @@ describe("live container state", () => {
     expect(h.railway.openSubscriptions).toBe(1);
   });
 
-  it("reads the stopped flag, not only the status", async () => {
+  it("completes a Stop by reading, since Railway pushes status changes only", async () => {
     const h = await harness();
     const tab = await h.events();
     const { id, serviceId } = await createObserved(h);
     h.railway.setDeployment(serviceId, "SUCCESS");
     await tab.next(upsert(id, "running"));
 
-    h.railway.setDeployment(serviceId, "SUCCESS", true);
+    await action(h, id, "stop");
+    await tab.next(upsert(id, "stopping"));
+    await h.settled();
+    // Railway stops it and tells no open subscription (the status stays SUCCESS).
+    await railwayStops(h, serviceId);
     await tab.next(upsert(id, "stopped"));
   });
 

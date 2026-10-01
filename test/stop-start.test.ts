@@ -1,6 +1,6 @@
 import { randomUUID } from "node:crypto";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
-import { type ContainerBody, type CreateBody, action, create, eventually, type Harness, type LiveEvent, list, startHarness } from "./harness.ts";
+import { type ContainerBody, type CreateBody, action, create, eventually, type Harness, type LiveEvent, list, startHarness, railwayStops } from "./harness.ts";
 
 let h: Harness;
 beforeEach(async () => {
@@ -36,7 +36,7 @@ async function stopped(): Promise<{ id: string; serviceId: string }> {
   const c = await running();
   await action(h, c.id, "stop");
   await h.settled();
-  h.railway.setDeployment(c.serviceId, "SUCCESS", true);
+  await railwayStops(h, c.serviceId);
   await eventually(async () => (await stateOf(c.id)) === "stopped");
   return c;
 }
@@ -61,7 +61,7 @@ describe("stopping and starting a container", () => {
     const [first] = h.railway.callsTo("stopDeployment");
     expect(first?.deploymentId).toBe(h.railway.services.get(serviceId)?.deploymentId);
 
-    h.railway.setDeployment(serviceId, "SUCCESS", true);
+    await railwayStops(h, serviceId);
     await tab.next(upsert(id, "stopped"));
 
     expect((await action(h, id, "start")).status).toBe(202);
@@ -163,7 +163,7 @@ describe("stopping and starting a container", () => {
     const { id } = await running();
     await action(h, id, "stop", "reused-key-1");
     await h.settled();
-    h.railway.setDeployment([...h.railway.services.keys()][0] ?? "", "SUCCESS", true);
+    await railwayStops(h, [...h.railway.services.keys()][0] ?? "");
     await eventually(async () => (await stateOf(id)) === "stopped");
 
     expect((await action(h, id, "start", "reused-key-1")).status).toBe(422);
