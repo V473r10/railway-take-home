@@ -198,3 +198,40 @@ describe("services the app did not create", () => {
     expect(h.railway.calls.filter((c) => c.method !== "listServices" && c.method !== "findService")).toEqual([]);
   });
 });
+
+describe("deployment phase", () => {
+  it("shows crashed, with Start allowed, when Railway reports FAILED after running", async () => {
+    const { id, serviceId } = await running();
+    h.railway.setDeployment(serviceId, "FAILED");
+    await eventually(async () => (await find(id))?.state === "crashed");
+
+    const c = await find(id);
+    expect(c?.lastError).toBeNull();
+    expect(c?.actions.start).toEqual({ allowed: true });
+    expect(c?.actions.stop.allowed).toBe(false);
+  });
+
+  it("fails the Create when Railway reports its deployment REMOVING", async () => {
+    const body = (await (await create(h)).json()) as CreateBody;
+    await h.settled();
+    const serviceId = (await find(body.container.id))?.serviceId ?? "";
+    const deploymentId = h.railway.services.get(serviceId)?.deploymentId;
+    await eventually(() => h.railway.callsTo("readDeployment").some((c) => c.deploymentId === deploymentId));
+    h.railway.setDeployment(serviceId, "REMOVING");
+    await eventually(async () => (await find(body.container.id))?.state === "failed");
+
+    expect((await find(body.container.id))?.lastError?.message).toMatch(/REMOVING/);
+  });
+
+  it("refuses a Start while Railway is still bringing the deployment up", async () => {
+    const { id, serviceId } = await running();
+    // Railway deploys it again on its own: no operation of the app is involved.
+    h.railway.setDeployment(serviceId, "DEPLOYING");
+    await eventually(async () => (await find(id))?.actions.stop.allowed === false);
+
+    const c = await find(id);
+    expect(c?.actions.start.allowed).toBe(false);
+    const res = await action(h, id, "start");
+    expect(res.status).toBe(409);
+  });
+});

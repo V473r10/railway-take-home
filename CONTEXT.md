@@ -88,6 +88,10 @@ _Avoid_: Failed, dead, errored
 What Railway last reported about a container. When it disagrees with what the app recorded, the observed state wins.
 _Avoid_: Real state, actual state, live state
 
+**Deployment phase**:
+What a deployment's observed state means for its container: serving, stopped, coming up, down or going away.
+_Avoid_: Status (that is Railway's raw value), health
+
 **Missing**:
 A container the app recorded whose service no longer exists on Railway because something outside the app removed it.
 _Avoid_: Orphan, deleted, lost
