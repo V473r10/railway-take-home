@@ -102,6 +102,8 @@ const LABEL: Record<OperationKind, string> = { create: "Create", start: "Start",
 
 /** How many times a Start looks for the deployment its redeploy produced before giving up. */
 export const NEW_DEPLOYMENT_LOOKUPS = 8;
+/** How many times a resumed Start looks for a deployment its previous process's redeploy made, before redeploying. */
+export const RESUME_LOOKUPS = 4;
 const LOOKUP_BACKOFF_MS = 1_000;
 const MAX_LOOKUP_BACKOFF_MS = 30_000;
 
@@ -235,6 +237,18 @@ type BegunOperation = {
   missing: boolean;
   /** A previous process already began this operation and stopped before it finished. */
   resumed: boolean;
+};
+
+/** A container the missing sweep judges. */
+type SweptRow = {
+  id: string;
+  name: string;
+  service_id: string;
+  current_deployment_id: string | null;
+  observed_status: string | null;
+  observed_stopped: boolean | null;
+  /** It has an operation in flight. */
+  busy: boolean;
 };
 
 const RETRY = { kind: "retry" } as const;
@@ -409,8 +423,10 @@ export class ContainerControl {
     const log = this.#deps.log ?? console.error;
     // Read before listing: a service recorded after this read may be too new for the
     // listing below, so only the ones recorded before it are judged.
-    const { rows } = await db.query<{ id: string; name: string; service_id: string }>(
-      "SELECT id, name, service_id FROM containers WHERE destroyed_at IS NULL AND missing_at IS NULL AND service_id IS NOT NULL",
+    const { rows } = await db.query<SweptRow>(
+      `SELECT c.id, c.name, c.service_id, c.current_deployment_id, c.observed_status, c.observed_stopped,
+              EXISTS (SELECT 1 FROM operations o WHERE o.container_id = c.id AND o.status IN ('pending', 'in_progress')) AS busy
+       FROM containers c WHERE c.destroyed_at IS NULL AND c.missing_at IS NULL AND c.service_id IS NOT NULL`,
     );
     if (rows.length === 0) return;
     const listed = await railway.listServices();
@@ -421,7 +437,10 @@ export class ContainerControl {
     }
     const present = new Set(listed.value.map((s) => s.serviceId));
     for (const row of rows) {
-      if (present.has(row.service_id)) continue;
+      if (present.has(row.service_id)) {
+        await this.#followReplacement(row);
+        continue;
+      }
       const marked = await transaction(db, async (client) => {
         const now = clock.now();
         const updated = await client.query(
@@ -442,6 +461,34 @@ export class ContainerControl {
       this.#observer.untrack(row.id);
       this.#publish(row.id);
     }
+  }
+
+  /**
+   * The container's deployment went away but its service is still there: something
+   * replaced the deployment (a redeploy from the Railway dashboard, or a redeploy of
+   * ours Railway listed late). Observed state wins, so the container follows the
+   * service's newest deployment instead of watching a removed one forever. Only for a
+   * container with no operation in flight: a Start or Destroy owns its deployment.
+   */
+  async #followReplacement(row: SweptRow): Promise<void> {
+    const { db, railway, clock } = this.#deps;
+    if (row.busy || !row.current_deployment_id || row.observed_status === null) return;
+    if (phaseOf({ status: row.observed_status, stopped: row.observed_stopped === true }) !== "going-away") return;
+    const latest = await railway.latestDeployment(row.service_id);
+    if (latest.kind !== "ok" || !latest.value) return;
+    const found = latest.value;
+    // A late listing can still show the removed one; the next sweep looks again.
+    if (found.deploymentId === row.current_deployment_id || phaseOf(found) === "going-away") return;
+    const { rowCount } = await db.query(
+      `UPDATE containers c SET current_deployment_id = $2, observed_status = $3, observed_stopped = $4, observed_at = $5
+       WHERE c.id = $1 AND c.current_deployment_id = $6 AND c.destroyed_at IS NULL AND c.missing_at IS NULL
+         AND NOT EXISTS (SELECT 1 FROM operations o WHERE o.container_id = c.id AND o.status IN ('pending', 'in_progress'))`,
+      [row.id, found.deploymentId, found.status, found.stopped, clock.now(), row.current_deployment_id],
+    );
+    if (!rowCount) return;
+    (this.#deps.log ?? console.error)(`${row.name}: deployment ${row.current_deployment_id} was replaced by ${found.deploymentId}; following it`);
+    this.#observer.track(row.id);
+    this.#publish(row.id);
   }
 
   /**
@@ -800,12 +847,11 @@ export class ContainerControl {
 
     if (op.resumed) {
       // The previous process's redeploy may have acted: a deployment newer than the replaced one says so.
-      const latest = await this.#call(operationId, () => railway.latestDeployment(serviceId), { signal });
-      if (latest.kind !== "ok") {
-        await restore();
-        return this.#unsuccessful(operationId, op.container_id, latest, "looking for the new deployment");
-      }
-      if (latest.value && latest.value.deploymentId !== replaced) return this.#adoptDeployment(operationId, op.container_id, latest.value);
+      // Railway can list the replaced one for a moment after a redeploy, so one look is not enough to
+      // conclude it did not act; redeploying on that would make a second deployment (found by the simulation).
+      const found = await this.#newDeployment(serviceId, replaced, signal, RESUME_LOOKUPS);
+      if (found === "interrupted") return;
+      if (found) return this.#adoptDeployment(operationId, op.container_id, found);
     }
 
     // A redeploy that acted shows up as a newer deployment; only without one is it repeated.
@@ -856,14 +902,19 @@ export class ContainerControl {
    * The deployment a redeploy produced: the service's latest one once it is not the
    * one it replaced. Railway may list the old one for a moment, so it asks a few times.
    */
-  async #newDeployment(serviceId: string, replaced: string | null, signal: AbortSignal): Promise<DeploymentState | null | "interrupted"> {
+  async #newDeployment(
+    serviceId: string,
+    replaced: string | null,
+    signal: AbortSignal,
+    lookups = NEW_DEPLOYMENT_LOOKUPS,
+  ): Promise<DeploymentState | null | "interrupted"> {
     const { railway, clock } = this.#deps;
     let backoff = LOOKUP_BACKOFF_MS;
-    for (let attempt = 1; attempt <= NEW_DEPLOYMENT_LOOKUPS; attempt++) {
+    for (let attempt = 1; attempt <= lookups; attempt++) {
       const outcome = await railway.latestDeployment(serviceId);
       if (outcome.kind === "ok" && outcome.value && outcome.value.deploymentId !== replaced) return outcome.value;
       if (outcome.kind === "rejected") return null;
-      if (attempt === NEW_DEPLOYMENT_LOOKUPS) break;
+      if (attempt === lookups) break;
       try {
         await clock.sleep(outcome.kind === "rate_limited" ? outcome.retryAfterMs : backoff, signal);
       } catch {

@@ -176,6 +176,27 @@ describe("missing", () => {
   });
 });
 
+describe("a deployment replaced outside the app", () => {
+  // Found by the simulation (seed 10): a container whose deployment was removed while
+  // its service lived on kept watching the removed deployment, whatever Railway ran next.
+  it("follows the new deployment when the service is redeployed from the Railway dashboard", async () => {
+    const { id, serviceId } = await running();
+    const before = h.railway.services.get(serviceId)?.deploymentId;
+    await h.railway.redeployService(serviceId);
+    const after = h.railway.services.get(serviceId)?.deploymentId;
+    expect(after).not.toBe(before);
+
+    await eventually(async () => {
+      if (h.clock.sleepers > 0) h.clock.advance(SUSPECT_RECHECK_MIN_MS);
+      const { rows } = await h.db.query<{ current_deployment_id: string }>("SELECT current_deployment_id FROM containers WHERE id = $1", [id]);
+      return rows[0]?.current_deployment_id === after;
+    });
+    h.railway.setDeployment(serviceId, "SUCCESS");
+    await eventually(async () => (await find(id))?.state === "running");
+    expect(h.railway.callsTo("redeployService")).toHaveLength(1);
+  });
+});
+
 describe("services the app did not create", () => {
   it("never lists nor destroys a prefixed service with no row, even past the lifetime", async () => {
     const foreign = h.railway.addServiceOutsideApp(`${SERVICE_NAME_PREFIX}00000000-0000-4000-8000-000000000000`);
