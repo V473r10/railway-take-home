@@ -12,6 +12,43 @@ leave a duplicate or an orphan, and the screen shows what Railway actually has.
   [CONTEXT.md](CONTEXT.md): the vocabulary; [issue #1](https://github.com/V473r10/railway-take-home/issues/1):
   the spec.
 
+## Three-minute demo: break it yourselves
+
+The claim above, checked live against real Railway with the chaos panel. Before you
+start: resume the app (`node scripts/railway-power.mjs resume`, see
+[Deployment](#deployment)), log in, and open the sandbox project (`railway-spike`) in
+Railway's dashboard next to the app. The sandbox must be empty.
+
+1. **Baseline (30 s).** Click **Create**, then **Timeline** on the new container:
+   `serviceCreate: answered`, `Railway reports SUCCESS`, `Create succeeded`. One
+   `rcc-<operation id>` service in the sandbox.
+2. **Lose a response (40 s).** In the chaos panel click **Lose the next response**, then
+   **Create**. Railway creates the service, the app never hears back. The timeline shows
+   the fault in violet, `serviceCreate: no response`, then
+   `Looked before repeating serviceCreate: it had acted`: not repeated. Two services in
+   the sandbox, not three.
+3. **Kill the process mid-create (60 s).** Click **Kill the process after the next
+   write**, then **Create**. The process dies right after Railway accepts the call;
+   Railway restarts it. The page can hang for about 30 s while Railway's proxy holds the
+   request for the new process. Then: `Create resumed by a new process`, the service the
+   dead process made is adopted, `running`. Three services, no duplicate.
+4. **Delete it behind the app's back (30 s).** Click **Delete on Railway** on any
+   container. It shows down at once and `missing` about 2 s later, with Stop and Start
+   refused. Destroy only closes the row; nothing is re-created.
+5. **What you did not see (20 s).** These faults, and thousands of nastier
+   interleavings, run in CI as a seeded simulation that checks for duplicates, orphans
+   and a screen that disagrees with Railway after every step. It found four bugs the
+   unit tests had missed; real Railway found a fifth (the kill switch, see
+   [Chaos mode](#chaos-mode)). Any failure replays exactly:
+
+   ```sh
+   SIM_SEEDS=500 npx vitest run test/simulation.test.ts
+   SIM_SEED=60 npx vitest run test/simulation.test.ts   # the orphaned-service bug, now a passing replay
+   ```
+
+Afterwards, destroy every container and pause the app
+(`node scripts/railway-power.mjs pause`, which refuses while the sandbox has services).
+
 ## Deployment
 
 Live at [app-production-c949.up.railway.app](https://app-production-c949.up.railway.app),
