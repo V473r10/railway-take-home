@@ -20,7 +20,7 @@ start: resume the app (`node scripts/railway-power.mjs resume`, see
 Railway's dashboard next to the app. The sandbox must be empty.
 
 1. **Baseline (30 s).** Click **Create**, then **Timeline** on the new container:
-   `serviceCreate: answered`, `Railway reports SUCCESS`, `Create succeeded`. One
+   `serviceCreate: answered`, `Railway reports the deployment running`, `Create succeeded`. One
    `rcc-<operation id>` service in the sandbox.
 2. **Lose a response (40 s).** In the chaos panel click **Lose the next response**, then
    **Create**. Railway creates the service, the app never hears back. The timeline shows
