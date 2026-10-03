@@ -111,9 +111,10 @@ describe("chaos mode", () => {
     h.clock.advance(60_000);
     await eventually(async () => (await list(h))[0]?.state === "missing");
     const kinds = (await timeline(id)).map((e) => e.kind);
-    // Between the two, Railway may report the deployment going away.
-    expect(kinds.indexOf("chaos")).toBeGreaterThan(-1);
-    expect(kinds.at(-1)).toBe("missing");
+    // Railway's report of the deployment going away can be recorded before or after the sweep's verdict.
+    const chaos = kinds.indexOf("chaos");
+    expect(chaos).toBeGreaterThan(-1);
+    expect(kinds.indexOf("missing")).toBeGreaterThan(chaos);
     expect((await post(`/api/containers/${id}/chaos/delete-outside`)).status).toBe(409);
   });
 
