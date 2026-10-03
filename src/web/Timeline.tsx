@@ -16,6 +16,16 @@ function shortId(id: string): string {
   return id.slice(0, 8);
 }
 
+/**
+ * Railway's `stopped` flag only means "stopped" next to `status: SUCCESS` (a stopped
+ * deployment keeps SUCCESS, see adapter.ts). A new deployment still starting can carry
+ * it too, and "DEPLOYING, stopped" reads as a contradiction, so only SUCCESS uses it.
+ */
+function observedWords(status: string, stopped: boolean): string {
+  if (status === "SUCCESS") return stopped ? "stopped" : "running";
+  return status.toLowerCase().replaceAll("_", " ");
+}
+
 /** What one entry says, in words, and how alarming it is. */
 function describe(entry: TimelineEntry): { tone: Tone; text: string; detail?: string } {
   switch (entry.kind) {
@@ -58,7 +68,7 @@ function describe(entry: TimelineEntry): { tone: Tone; text: string; detail?: st
     case "deployment":
       return { tone: "info", text: `New deployment ${shortId(entry.deploymentId)}` };
     case "observed":
-      return { tone: "info", text: `Railway reports ${entry.status}${entry.stopped ? ", stopped" : ""}`, detail: `deployment ${shortId(entry.deploymentId)}` };
+      return { tone: "info", text: `Railway reports the deployment ${observedWords(entry.status, entry.stopped)}`, detail: `deployment ${shortId(entry.deploymentId)}` };
     case "succeeded":
       return { tone: "ok", text: `${OPERATION[entry.operation]} succeeded` };
     case "failed":
