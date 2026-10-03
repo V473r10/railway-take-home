@@ -281,8 +281,9 @@ it was asked, and time runs past every lifetime.
 The steps are a pure function of the seed, so a failure prints its seed and trace, and
 `SIM_SEED=<n>` replays it. Postgres is real, so the interleaving inside a step can vary
 between runs; every finding below replayed from its seed. CI runs 10 seeds (about 25 s).
-Before merging, seeds 1 to 800 ran clean on the final code (seeds 401 to 800 in one
-sweep; the earlier sweep's failures replayed clean after their fixes).
+Before merging, 800 seeds ran: 401 to 800 clean on the final code; 1 to 400 on the code
+before the last fix, where the only failures were that fix's bug (seeds 138, 262, 381),
+which replay clean now.
 
 **What it found**, each now a regular test that failed before its fix:
 
