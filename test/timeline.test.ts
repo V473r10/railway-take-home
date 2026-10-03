@@ -144,7 +144,8 @@ describe("a container's timeline", () => {
     h.railway.deleteOutsideApp(serviceId);
     h.clock.advance(60_000);
     await eventually(async () => (await list(h))[0]?.state === "missing");
-    expect(lines(await timeline(id)).at(-1)).toBe("missing");
+    // Railway's report of the deployment going away can be recorded before or after the sweep's verdict.
+    expect(lines(await timeline(id)).filter((l) => !l.startsWith("observed")).at(-1)).toBe("missing");
   });
 
   it("is sent live to every open stream", async () => {

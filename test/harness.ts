@@ -4,6 +4,7 @@
 import { randomUUID } from "node:crypto";
 import pg from "pg";
 import { createApp } from "../src/server/app.ts";
+import { ChaosRailway } from "../src/server/chaos.ts";
 import { type Clock, ManualClock } from "../src/server/clock.ts";
 import { ContainerControl } from "../src/server/containers.ts";
 import { connect, type Db, migrate } from "../src/server/db.ts";
@@ -45,9 +46,11 @@ export type Harness = {
    */
   restart: (beforeBoot?: (railway: FakeRailway) => void) => Promise<void>;
   close: () => Promise<void>;
+  /** The current process's chaos mode, when the harness was started with it. Its kill switch kills the process. */
+  readonly chaos: ChaosRailway | undefined;
 };
 
-export async function startHarness(): Promise<Harness> {
+export async function startHarness(options: { chaos?: boolean } = {}): Promise<Harness> {
   const name = `rcc_test_${randomUUID().replaceAll("-", "")}`;
   const admin = new pg.Client({ connectionString: ADMIN_URL });
   try {
@@ -80,12 +83,14 @@ export async function startHarness(): Promise<Harness> {
       every: (ms, run, signal) => clock.every(ms, run, AbortSignal.any([signal, alive.signal])),
     };
     line.onKill(() => alive.abort());
-    const control = new ContainerControl({ db, railway: line, clock: processClock, log });
+    const chaos = options.chaos ? new ChaosRailway({ railway: line, db, crash: () => line.kill(), log }) : undefined;
+    const control = new ContainerControl({ db, railway: chaos ?? line, clock: processClock, log });
+    chaos?.useTimeline(control.timeline);
     await control.start();
     // The identity check at boot is not something a test's own requests caused.
     const identity = railway.calls.findIndex((c) => c.method === "verifyIdentity");
     if (identity !== -1) railway.calls.splice(identity, 1);
-    return { db, line, control, app: createApp({ control, gate, log }) };
+    return { db, line, control, chaos, app: createApp({ control, gate, log, chaos }) };
   };
   let current = await boot();
   const streams = new Set<EventStream>();
@@ -127,6 +132,9 @@ export async function startHarness(): Promise<Harness> {
     spare: () => current.line.spare(),
     get dead() {
       return current.line.dead;
+    },
+    get chaos() {
+      return current.chaos;
     },
     restart: async (beforeBoot) => {
       await closeStreams();

@@ -218,3 +218,44 @@ button.link {
 .tone-bad .timeline-text {
   color: var(--danger);
 }
+
+.tone-chaos {
+  --tone: var(--accent);
+}
+
+.tone-chaos .timeline-text {
+  color: var(--accent);
+  font-weight: 600;
+}
+
+.chaos {
+  margin-top: 1rem;
+  padding: 0.75rem 1rem;
+  border: 1px dashed var(--accent);
+  border-radius: 0.4rem;
+}
+
+.chaos h2 {
+  font-size: 1rem;
+  margin: 0 0 0.25rem;
+  color: var(--accent);
+}
+
+.chaos-buttons {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.4rem;
+  margin: 0.5rem 0;
+}
+
+.chaos-buttons button[aria-pressed="true"] {
+  background: var(--accent);
+  border-color: var(--accent);
+  color: #fff;
+}
+
+button.chaos-button {
+  border-style: dashed;
+  border-color: var(--accent);
+  color: var(--accent);
+}

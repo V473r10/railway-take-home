@@ -33,6 +33,7 @@ Variables of the app service:
 | `APP_PASSWORD` | The shared password. |
 | `SESSION_SECRET` | Signs the session cookie (at least 32 characters). |
 | `DATABASE_URL` | A reference to `${{Postgres.DATABASE_URL}}`. |
+| `CHAOS` | `1` shows the chaos panel (see below). Off by default. |
 
 The token is used by the server only; the browser never receives it. Migrations run at
 startup, under an advisory lock. The service's health check (`/api/health`), restart
@@ -81,6 +82,24 @@ RAILWAY_FAKE=1 DATABASE_URL=... APP_PASSWORD=... SESSION_SECRET=... npm run dev
 `RAILWAY_FAKE=1` swaps Railway for the same in-memory fake the tests use, with
 deployments that succeed on their own after 1.5 s, so the UI can be used end to end
 without a token. Tests read `TEST_DATABASE_URL` and default to the throwaway cluster.
+
+## Chaos mode
+
+With `CHAOS=1` the UI shows a panel that breaks the app on purpose, against real Railway:
+lose the response of the next call that changes something (Railway acts, the app never
+hears), kill the process right after such a call reaches Railway, kill it now, cut every
+WebSocket subscription, or delete a container's service straight on Railway. Open a
+container's timeline to watch the app recover: it looks before repeating, resumes after
+the restart, resubscribes, marks the container missing.
+
+The kill switches send the process `SIGKILL`; Railway's `ON_FAILURE` restart policy
+(set by `railway-power.mjs configure`) starts it again. Locally, run it under
+`npm run start:supervised`, which does the same. Against `RAILWAY_FAKE=1` a kill also
+wipes the in-memory fake, so the restarted app finds every service gone: use real
+Railway to see a kill recover.
+
+Anyone with the password can use the panel, kill switch included, so it is meant for a
+demo instance, not one people depend on.
 
 ## Smoke test against real Railway
 

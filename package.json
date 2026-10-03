@@ -10,6 +10,7 @@
     "dev:web": "vite",
     "build": "vite build",
     "start": "node src/server/main.ts",
+    "start:supervised": "scripts/supervise.sh",
     "typecheck": "tsc --noEmit",
     "test": "vitest run",
     "test:local": "scripts/test-db.sh && vitest run",

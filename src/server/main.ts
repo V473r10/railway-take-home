@@ -1,6 +1,7 @@
 import { join } from "node:path";
 import { serve } from "@hono/node-server";
 import { createApp } from "./app.ts";
+import { ChaosRailway } from "./chaos.ts";
 import { systemClock } from "./clock.ts";
 import { ContainerControl } from "./containers.ts";
 import { connect, migrate } from "./db.ts";
@@ -45,9 +46,19 @@ function railwayFromEnv(): RailwayAdapter {
 const gate = gateFromEnv();
 const db = connect(required("DATABASE_URL"));
 await migrate(db);
-const control = new ContainerControl({ db, railway: railwayFromEnv(), clock: systemClock });
+const railway = railwayFromEnv();
+// Chaos mode: a panel in the UI to break the app on purpose (src/server/chaos.ts).
+// Its kill switch relies on the process being restarted after a crash: Railway's
+// ON_FAILURE restart policy does that in production, scripts/supervise.sh locally.
+const chaos =
+  process.env.CHAOS === "1"
+    ? new ChaosRailway({ railway, db, crash: () => process.kill(process.pid, "SIGKILL"), log: console.error })
+    : undefined;
+if (chaos) console.warn("CHAOS=1: chaos mode is on; anyone with the password can break this app on purpose");
+const control = new ContainerControl({ db, railway: chaos ?? railway, clock: systemClock });
+chaos?.useTimeline(control.timeline);
 await control.start();
-const app = createApp({ control, gate, webRoot: join(import.meta.dirname, "..", "..", "dist", "web") });
+const app = createApp({ control, gate, chaos, webRoot: join(import.meta.dirname, "..", "..", "dist", "web") });
 
 const port = Number(process.env.PORT ?? 3000);
 // Railway's proxy and health check reach the container from outside, so there the

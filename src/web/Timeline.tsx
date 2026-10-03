@@ -1,6 +1,14 @@
 import type { TimelineEntry } from "./api.ts";
 
-type Tone = "ok" | "warn" | "bad" | "info";
+type Tone = "ok" | "warn" | "bad" | "info" | "chaos";
+
+const CHAOS_TEXT: Record<string, string> = {
+  drop_next_response: "Chaos: Railway acted, its response was dropped",
+  crash_after_next_write: "Chaos: Railway acted, the process was killed before it heard back",
+  delete_outside: "Chaos: service deleted on Railway, outside this app",
+  cut_subscriptions: "Chaos: WebSocket cut",
+  crash_now: "Chaos: process killed",
+};
 
 const OPERATION: Record<string, string> = { create: "Create", stop: "Stop", start: "Start", destroy: "Destroy" };
 
@@ -63,6 +71,8 @@ function describe(entry: TimelineEntry): { tone: Tone; text: string; detail?: st
       };
     case "missing":
       return { tone: "bad", text: "Service deleted outside the app" };
+    case "chaos":
+      return { tone: "chaos", text: CHAOS_TEXT[entry.fault] + (entry.call ? ` (${entry.call})` : "") };
     case "followed":
       return { tone: "info", text: `Deployment replaced outside the app; following ${shortId(entry.deploymentId)}` };
   }
