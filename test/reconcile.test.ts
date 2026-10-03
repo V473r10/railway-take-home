@@ -84,6 +84,24 @@ describe("a create interrupted by a restart", () => {
     expect(container?.url).toBe(`https://${container?.name}.up.railway.app`);
   });
 
+  // Found by the simulation (seed 60): the resumed create's lookup was refused, so the
+  // service the dead instance made was never recorded, and the Destroy that followed
+  // (the lifetime's) closed the container without looking: the service was orphaned.
+  it("killed after serviceCreate, then the lookup is refused: a Destroy still deletes the service", async () => {
+    await killDuring("createContainer", "after_acting", () => create(h));
+    await h.restart((railway) => railway.failNextOn("findService", { kind: "rejected", message: "lookup refused" }));
+    await h.settled();
+    const [container] = await list(h);
+    expect(container).toMatchObject({ state: "failed", serviceId: null });
+    expect(h.railway.services.size).toBe(1);
+
+    expect((await action(h, container?.id ?? "", "destroy")).status).toBe(202);
+    await h.settled();
+
+    expect(await list(h)).toEqual([]);
+    expect(h.railway.services.size).toBe(0);
+  });
+
   it("refuses a Stop while the resumed create is still running", async () => {
     await killDuring("createContainer", "after_acting", () => create(h));
     await h.restart();

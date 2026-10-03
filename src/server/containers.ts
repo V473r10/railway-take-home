@@ -897,9 +897,12 @@ export class ContainerControl {
 
     // A missing container's service is already gone: there is nothing to delete, only the row to close.
     let serviceId = op.missing ? null : op.service_id;
-    // A resumed Destroy may have deleted the service already, and a create Railway never
-    // confirmed may have made one anyway. Either way the container's name tells.
-    if (!op.missing && (op.resumed || (!serviceId && (await this.#createWasAmbiguous(containerId))))) {
+    // A resumed Destroy may have deleted the service already, and a container with no
+    // service recorded may have one anyway: a create that died or failed after Railway
+    // acted never got to record it. Either way the container's name tells. Looking only
+    // when the create was flagged ambiguous is not enough: a resumed create whose own
+    // lookup was refused clears no doubt, and its service was orphaned (simulation, seed 60).
+    if (!op.missing && (op.resumed || !serviceId)) {
       const found = await this.#call(operationId, () => railway.findService(op.name), { signal: this.#closing.signal });
       if (found.kind !== "ok") {
         this.#observer.track(containerId);
@@ -1012,15 +1015,6 @@ export class ContainerControl {
       await db.query("UPDATE operations SET last_outcome_ambiguous = false WHERE id = $1", [operationId]);
     }
     return outcome;
-  }
-
-  /** Whether the container's create ended without Railway ever answering it. */
-  async #createWasAmbiguous(containerId: string): Promise<boolean> {
-    const { rows } = await this.#deps.db.query<{ ambiguous: boolean }>(
-      "SELECT last_outcome_ambiguous AS ambiguous FROM operations WHERE container_id = $1 AND kind = 'create'",
-      [containerId],
-    );
-    return rows[0]?.ambiguous === true;
   }
 
   #publish(containerId: string): void {
