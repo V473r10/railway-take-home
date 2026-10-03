@@ -86,6 +86,10 @@ acts, starts a second instance on the same database and fake, and asserts exactl
 service every time. Mention the mutation check: with the reconciler removed, 8 of the
 10 fail.
 
+**Live, with `CHAOS=1`:** the chaos panel's **Kill the process after the next write**
+shows the harder case against real Railway, with the resume visible in the container's
+timeline. Steps 2 and 3 of the README's three-minute demo.
+
 ## 5. More failures, from the tests (3 min)
 
 Open `test/retries.test.ts` and show two:
