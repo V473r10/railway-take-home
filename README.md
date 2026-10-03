@@ -92,7 +92,9 @@ WebSocket subscription, or delete a container's service straight on Railway. Ope
 container's timeline to watch the app recover: it looks before repeating, resumes after
 the restart, resubscribes, marks the container missing.
 
-The kill switches send the process `SIGKILL`; Railway's `ON_FAILURE` restart policy
+The kill switches end the process at once with exit status 137, as a `SIGKILL` would, but
+without the signal: on Railway the app is PID 1 of its container, and the kernel ignores a
+`SIGKILL` that PID 1 sends itself. Railway's `ON_FAILURE` restart policy
 (set by `railway-power.mjs configure`) starts it again. Locally, run it under
 `npm run start:supervised`, which does the same. Against `RAILWAY_FAKE=1` a kill also
 wipes the in-memory fake, so the restarted app finds every service gone: use real
@@ -139,3 +141,25 @@ for real: it resumed the stuck Stop, read the deployment and completed it.
 | Delete a service from outside the app | `crashed` at once, `missing` after 3.8 s; Destroy then closes it |
 | Destroy both | sandbox empty |
 | Pause | app `SUCCESS (stopped)`, no longer `CRASHED` |
+
+**2026-10-03, chaos panel against real Railway (`CHAOS=1`): passed after one fix.** The
+first pass found that the kill switch did not kill: the log said "killing the process" and
+the app kept serving, with the Create it had interrupted hanging in `creating`. On Railway
+the app is PID 1 of its container, and the kernel drops a `SIGKILL` that PID 1 sends
+itself. The kill is now `process.exit(137)`. Deploying the fix also resumed that hung
+Create, which adopted the service Railway had already made. The second pass:
+
+| Fault | Result |
+| --- | --- |
+| Lose the response of the next write, then Create | the app looked Railway up (`acted`), adopted the service; `running` after 7 s, 1 service, URL 200 |
+| Kill the process right after `serviceCreate` | the restarted process resumed the Create; `running`, 2 services, no duplicate; the fault does not survive the restart |
+| Stop, then kill now | the restarted process resumed the Stop; `stopped` 3 s later |
+| Kill right after the redeploy of a Start | resumed, adopted the new deployment; `running`, no extra service |
+| Cut every WebSocket subscription, then Stop | `stopped` 2.4 s later |
+| Delete a service straight on Railway | `crashed` at once, `missing` after 1.7 s |
+| Destroy both | sandbox empty |
+
+A kill does not always show from outside as downtime: after "kill now" requests failed
+for a moment, but after the two kills on a write, Railway's proxy held the next request
+about 30 s and answered it from the new process. The resumed operation in the timeline is
+the evidence either way.
