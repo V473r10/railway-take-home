@@ -61,8 +61,14 @@ describe("a container whose public domain was refused", () => {
     h.railway.setDeployment(serviceId, "SUCCESS");
     await eventually(async () => (await stateOf(id)) === "failed");
     expect((await list(h))[0]?.url).toBeNull();
+    // The Create fails before the observer stores the deployment; a Stop sent in between
+    // has nothing to stop (seen on loaded CI runners).
+    await eventually(async () => {
+      const { entries } = (await (await h.request(`/api/containers/${id}/timeline`)).json()) as { entries: { kind: string; status?: string }[] };
+      return entries.some((e) => e.kind === "observed" && e.status === "SUCCESS");
+    });
 
-    await action(h, id, "stop");
+    expect((await action(h, id, "stop")).status).toBe(202);
     await h.settled();
     await railwayStops(h, serviceId);
     await eventually(async () => (await stateOf(id)) === "stopped");
