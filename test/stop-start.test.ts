@@ -48,6 +48,35 @@ async function currentDeploymentId(containerId: string): Promise<string | null> 
   return rows[0]?.current_deployment_id ?? null;
 }
 
+describe("a container whose public domain was refused", () => {
+  // Found by the simulation (seed 66): Railway refused the domain during the create, a
+  // later Start brought the container up, and it showed running with no URL.
+  it("gets its domain on the next Start instead of running without a URL", async () => {
+    h.railway.failNextOn("createDomain", { kind: "rejected", message: "sim: no domain for you" });
+    const body = (await (await create(h)).json()) as CreateBody;
+    const id = body.container.id;
+    await h.settled();
+    await eventually(() => h.railway.callsTo("readDeployment").length === 1);
+    const serviceId = [...h.railway.services.keys()].at(-1) ?? "";
+    h.railway.setDeployment(serviceId, "SUCCESS");
+    await eventually(async () => (await stateOf(id)) === "failed");
+    expect((await list(h))[0]?.url).toBeNull();
+
+    await action(h, id, "stop");
+    await h.settled();
+    await railwayStops(h, serviceId);
+    await eventually(async () => (await stateOf(id)) === "stopped");
+    expect((await action(h, id, "start")).status).toBe(202);
+    await h.settled();
+    h.railway.setDeployment(serviceId, "SUCCESS");
+    await eventually(async () => (await stateOf(id)) === "running");
+
+    const [container] = await list(h);
+    expect(container?.url).toBe(`https://${container?.name}.up.railway.app`);
+    expect(h.railway.callsTo("createDomain")).toHaveLength(2);
+  });
+});
+
 describe("stopping and starting a container", () => {
   it("goes running, stopping, stopped, starting, running", async () => {
     const tab = await h.events();

@@ -844,6 +844,20 @@ export class ContainerControl {
       await restore();
       return this.#failAndPublish(operationId, op.container_id, "The container has no Railway service to start.");
     }
+    if (!op.domain) {
+      // Railway refused the domain when the container was created. A container is never
+      // brought online without its URL (found by the simulation, seed 66): get it first.
+      const domain = await this.#domainFor(operationId, serviceId, true, signal);
+      if (domain.kind !== "ok") {
+        await restore();
+        // Not left active when unanswered: the next Start looks for the domain before making one.
+        if (domain.kind === "ambiguous") {
+          return this.#failAndPublish(operationId, op.container_id, `No response from Railway while creating the public domain: ${domain.reason}`);
+        }
+        return this.#unsuccessful(operationId, op.container_id, domain, "creating the public domain");
+      }
+      await db.query("UPDATE containers SET domain = $2 WHERE id = $1", [op.container_id, domain.value.domain]);
+    }
 
     if (op.resumed) {
       // The previous process's redeploy may have acted: a deployment newer than the replaced one says so.
