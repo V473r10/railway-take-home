@@ -204,6 +204,24 @@ stream.
   requested once and ended once in its timeline, the way the operations table says it
   did. Removing a single write makes most seeds fail.
 
+### Chaos mode: break it on purpose, in the running app
+
+The tests prove recovery against the fake; chaos mode (`CHAOS=1`, `src/server/chaos.ts`)
+lets a person cause the same faults in the deployed app and read the recovery in the
+timeline. It wraps the Railway adapter: an armed fault waits for the next call that
+changes something on Railway, lets Railway act, then either drops the response
+(an ambiguous outcome) or kills the process before it hears back. Beside those, it can
+kill the process now, end every subscription as a dropped socket would, and delete a
+container's service straight on Railway as the dashboard would.
+
+- **Faults the app already survives, nothing new.** Each one is injected by the tests
+  too; the panel adds no code path the app does not already have to handle.
+- **Off by default, behind the password.** Its kill switch is a denial of service for
+  anyone with the password, which is fine for a demo instance and the reason it is a flag.
+- **Rejected: inject faults into the real GraphQL client.** The adapter boundary
+  already exists and is what the tests fake; wrapping it keeps chaos out of the code
+  that talks to Railway.
+
 ## Cost guards
 
 The whole app runs on a Hobby plan with USD 5 of credit, behind a public URL.

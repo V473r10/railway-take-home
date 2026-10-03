@@ -48,6 +48,7 @@ export type TimelineEntry = {
   | { kind: "unanswered"; operation: OperationKind; message: string }
   | { kind: "missing" }
   | { kind: "followed"; deploymentId: string }
+  | { kind: "chaos"; fault: ArmedFault | "delete_outside" | "cut_subscriptions" | "crash_now"; call?: string }
 );
 
 /** Set while the app cannot confirm who its Railway token belongs to; every operation is refused (ADR 0003). */
@@ -153,3 +154,31 @@ export function mergeTimeline(a: readonly TimelineEntry[], b: readonly TimelineE
   for (const entry of [...a, ...b]) bySeq.set(entry.seq, entry);
   return [...bySeq.values()].sort((x, y) => (BigInt(x.seq) < BigInt(y.seq) ? -1 : 1));
 }
+
+/** A chaos fault that waits for the app's next call that changes something on Railway. */
+export type ArmedFault = "drop_next_response" | "crash_after_next_write";
+
+export type ChaosState = { enabled: boolean; armed: ArmedFault | null };
+
+async function chaosPost<T>(path: string, body?: unknown): Promise<T> {
+  const res = await fetch(path, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: body === undefined ? undefined : JSON.stringify(body),
+  });
+  if (!res.ok) throw await refusal(res);
+  return (await res.json()) as T;
+}
+
+/** Whether chaos mode is on (CHAOS=1 on the server), and what is armed. */
+export async function fetchChaos(): Promise<ChaosState> {
+  const res = await fetch("/api/chaos");
+  if (!res.ok) throw await refusal(res);
+  return (await res.json()) as ChaosState;
+}
+
+export const armChaos = (fault: ArmedFault | null) => chaosPost<ChaosState>("/api/chaos/arm", { fault });
+export const cutSubscriptions = () => chaosPost<{ cut: number }>("/api/chaos/cut-subscriptions");
+export const crashServer = () => chaosPost<{ crashing: true }>("/api/chaos/crash");
+export const deleteOutside = (containerId: string) =>
+  chaosPost<{ deleted: true }>(`/api/containers/${encodeURIComponent(containerId)}/chaos/delete-outside`);

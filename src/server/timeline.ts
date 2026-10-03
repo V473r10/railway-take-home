@@ -1,3 +1,4 @@
+import type { ArmedFault } from "./chaos.ts";
 import type { Clock } from "./clock.ts";
 import type { OperationKind } from "./containers.ts";
 import type { Db } from "./db.ts";
@@ -43,7 +44,9 @@ export type TimelineEvent =
   /** The service was found deleted outside the app. */
   | { kind: "missing" }
   /** The deployment was replaced outside the app (a redeploy from Railway's dashboard); the container follows the new one. */
-  | { kind: "followed"; deploymentId: string };
+  | { kind: "followed"; deploymentId: string }
+  /** Chaos mode broke something on purpose here (src/server/chaos.ts); `call` is the call an armed fault hit. */
+  | { kind: "chaos"; fault: ArmedFault | "delete_outside" | "cut_subscriptions" | "crash_now"; call?: RailwayCall };
 
 export type TimelineEntry = TimelineEvent & {
   /** Insertion order; a string because Postgres bigints do not fit a JS number in general. */

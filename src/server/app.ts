@@ -13,6 +13,7 @@ import {
   IdempotencyKeyReused,
   ReadOnlyRefused,
 } from "./containers.ts";
+import { ARMED_FAULTS, type ArmedFault, type ChaosRailway } from "./chaos.ts";
 import { type GateConfig, mountPasswordGate } from "./gate.ts";
 import { LiveFeed } from "./live.ts";
 
@@ -23,10 +24,20 @@ const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 const SSE_RETRY_MS = 2_000;
 const SSE_HEARTBEAT_MS = 20_000;
 
-export type AppDeps = { control: ContainerControl; gate: GateConfig; webRoot?: string; log?: (msg: string) => void };
+export type AppDeps = {
+  control: ContainerControl;
+  gate: GateConfig;
+  webRoot?: string;
+  log?: (msg: string) => void;
+  /** Chaos mode (CHAOS=1): the routes that break the app on purpose. Absent, they answer 404. */
+  chaos?: ChaosRailway;
+};
+
+/** After answering a request to kill the process, wait this long so the answer reaches the browser first. */
+export const CRASH_DELAY_MS = 200;
 
 /** The HTTP API, which is also the one seam every test enters through. */
-export function createApp({ control, gate, webRoot, log }: AppDeps): Hono {
+export function createApp({ control, gate, webRoot, log, chaos }: AppDeps): Hono {
   const app = new Hono();
   const feed = new LiveFeed(control, log);
 
@@ -105,6 +116,38 @@ export function createApp({ control, gate, webRoot, log }: AppDeps): Hono {
       throw error;
     }
   });
+
+  // Chaos mode (src/server/chaos.ts). Behind the password gate like everything else;
+  // the session cookie is SameSite=Lax, so another site cannot post these for a visitor.
+  app.get("/api/chaos", (c) => c.json(chaos ? { enabled: true, ...chaos.state } : { enabled: false, armed: null }));
+
+  if (chaos) {
+    app.post("/api/chaos/arm", async (c) => {
+      const body = (await c.req.json().catch(() => null)) as { fault?: unknown } | null;
+      const fault = body?.fault === null ? null : ARMED_FAULTS.find((f) => f === body?.fault);
+      if (fault === undefined) return c.json({ error: `fault must be null or one of ${ARMED_FAULTS.join(", ")}` }, 400);
+      chaos.arm(fault as ArmedFault | null);
+      return c.json({ enabled: true, ...chaos.state });
+    });
+
+    app.post("/api/chaos/cut-subscriptions", async (c) => c.json({ cut: await chaos.cutSubscriptions() }));
+
+    app.post("/api/chaos/crash", (c) => {
+      // Answer first: the browser should hear that the kill was accepted, not just lose the connection.
+      setTimeout(() => void chaos.crashNow(), CRASH_DELAY_MS);
+      return c.json({ crashing: true }, 202);
+    });
+
+    app.post("/api/containers/:id/chaos/delete-outside", async (c) => {
+      const id = c.req.param("id");
+      if (!UUID.test(id)) return c.json({ error: "No such container." }, 404);
+      if (control.readOnly) return c.json({ error: control.readOnly.reason }, 503);
+      const result = await chaos.deleteOutside(id);
+      if (result === "deleted") return c.json({ deleted: true }, 202);
+      if (result === "no_service") return c.json({ error: "This container has no Railway service to delete." }, 409);
+      return c.json({ error: `Railway did not delete the service (${result.kind}).` }, 502);
+    });
+  }
 
   app.all("/api/*", (c) => c.json({ error: "Not found" }, 404));
 

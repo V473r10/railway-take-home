@@ -4,6 +4,8 @@ import {
   type Container,
   type ContainerAction,
   createContainer,
+  deleteOutside,
+  fetchChaos,
   fetchTimeline,
   hasSession,
   logIn,
@@ -14,6 +16,7 @@ import {
   subscribeToContainers,
   type TimelineEntry,
 } from "./api.ts";
+import { ChaosPanel, useChaos } from "./ChaosPanel.tsx";
 import { Timeline } from "./Timeline.tsx";
 
 type OpenTimeline = { entries: TimelineEntry[]; loading: boolean; error: string | null };
@@ -51,11 +54,13 @@ function Countdown({ expiresAt, now }: { expiresAt: string; now: number }) {
  * Stop, Start and Destroy for one container. Availability comes from the server,
  * so a button is disabled for the same reason the API would refuse the click.
  */
-function ContainerActions({ container, sending, readOnly, onAction }: {
+function ContainerActions({ container, sending, readOnly, onAction, onDeleteOutside }: {
   container: Container;
   sending: boolean;
   readOnly: boolean;
   onAction: (action: ContainerAction) => void;
+  /** Chaos mode only: delete the service straight on Railway, as Railway's dashboard would. */
+  onDeleteOutside?: () => void;
 }) {
   const { stop, start } = container.actions;
   const onDestroy = () => {
@@ -90,6 +95,12 @@ function ContainerActions({ container, sending, readOnly, onAction }: {
         Destroy
         <span className="visually-hidden"> {container.name}</span>
       </button>
+      {onDeleteOutside && container.state !== "missing" && (
+        <button type="button" className="chaos-button" onClick={onDeleteOutside} disabled={sending}>
+          Delete on Railway
+          <span className="visually-hidden"> {container.name}, outside this app</span>
+        </button>
+      )}
       {hint && (
         <small id={hintId} className="hint">
           {hint}
@@ -187,6 +198,7 @@ function Containers({ onStreamClosed, onSessionEnded }: { onStreamClosed: () => 
   // The timelines on screen, by container. Fetched when opened, then kept current from the live stream.
   const [timelines, setTimelines] = useState<Readonly<Record<string, OpenTimeline>>>({});
   const openTimelines = useRef<ReadonlySet<string>>(new Set());
+  const [chaos, setChaos] = useChaos(fetchChaos);
 
   const loadTimeline = useCallback(
     (id: string) => {
@@ -275,6 +287,16 @@ function Containers({ onStreamClosed, onSessionEnded }: { onStreamClosed: () => 
     }
   };
 
+  const onDeleteOutside = async (containerId: string) => {
+    try {
+      await deleteOutside(containerId);
+      setError(null);
+    } catch (e) {
+      if (e instanceof NotLoggedIn) return onSessionEnded();
+      setError(e instanceof Error ? e.message : String(e));
+    }
+  };
+
   // A hint only: the server refuses the create either way, with its own message.
   const atLimit = containerLimit !== null && containers !== null && containers.length >= containerLimit;
   const createHintId = readOnly ? READ_ONLY_BANNER_ID : atLimit ? LIMIT_HINT_ID : undefined;
@@ -300,6 +322,8 @@ function Containers({ onStreamClosed, onSessionEnded }: { onStreamClosed: () => 
           )}
         </div>
       </header>
+
+      {chaos?.enabled && <ChaosPanel state={chaos} onState={setChaos} onSessionEnded={onSessionEnded} />}
 
       {readOnly && (
         <p id={READ_ONLY_BANNER_ID} role="alert" className="banner-read-only">
@@ -388,6 +412,7 @@ function Containers({ onStreamClosed, onSessionEnded }: { onStreamClosed: () => 
                         sending={sending.has(c.id)}
                         readOnly={readOnly !== null}
                         onAction={(action) => void onAction(c.id, action)}
+                        onDeleteOutside={chaos?.enabled ? () => void onDeleteOutside(c.id) : undefined}
                       />
                     </td>
                   </tr>
