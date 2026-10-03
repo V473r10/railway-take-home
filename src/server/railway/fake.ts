@@ -60,6 +60,8 @@ export class FakeRailway implements RailwayAdapter {
   readonly calls: FakeCall[] = [];
   readonly services = new Map<string, FakeService>();
   readonly deployments = new Map<string, DeploymentState>();
+  /** Deployments Railway accepted a stop for; only these may become stopped. */
+  readonly stopsAccepted = new Set<string>();
   readonly #options: FakeRailwayOptions;
   /** Services deleted from outside that Railway still lists, for this many more listings. */
   readonly #stillListed = new Map<string, { name: string; calls: number }>();
@@ -89,6 +91,12 @@ export class FakeRailway implements RailwayAdapter {
   /** Queue failures for one mutation; each call to it consumes one before behaving normally. */
   failNextOn(method: FakeMutation, ...failures: InjectedFailure[]): void {
     this.#failures.set(method, [...(this.#failures.get(method) ?? []), ...failures]);
+  }
+
+  /** Forget every failure still queued, so upcoming calls behave normally. */
+  clearFailures(): void {
+    this.#failures.clear();
+    this.#staleLatest = 0;
   }
 
   /** The next `calls` latestDeployment calls after a redeploy still list the replaced deployment, as Railway may for a moment. */
@@ -216,6 +224,7 @@ export class FakeRailway implements RailwayAdapter {
     if (early) return early;
     const state = this.deployments.get(deploymentId);
     if (!state) return notFound("Deployment not found");
+    this.stopsAccepted.add(deploymentId);
     // Railway takes a moment to stop it; tests move it with setDeployment(..., "SUCCESS", true).
     if (this.#options.autoSucceedAfterMs !== undefined) {
       const service = [...this.services.values()].find((s) => s.deploymentId === deploymentId);
