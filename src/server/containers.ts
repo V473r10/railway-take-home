@@ -1037,9 +1037,12 @@ export class ContainerControl {
     let settled = 0;
     if (phase === "serving" || phase === "stopped") {
       const kinds = phase === "stopped" ? ["stop"] : ["create", "start"];
+      // A serving deployment completes a Create or Start only once the container has its URL:
+      // a domain Railway never answered for is still the reconciler's to find (simulation, seed 138).
       const result = await db.query(
-        `UPDATE operations SET status = 'succeeded', updated_at = $2
-         WHERE container_id = $1 AND kind = ANY($3) AND status = 'in_progress'`,
+        `UPDATE operations o SET status = 'succeeded', updated_at = $2
+         WHERE o.container_id = $1 AND o.kind = ANY($3) AND o.status = 'in_progress'
+           AND (o.kind = 'stop' OR EXISTS (SELECT 1 FROM containers c WHERE c.id = o.container_id AND c.domain IS NOT NULL))`,
         [containerId, clock.now(), kinds],
       );
       settled = result.rowCount ?? 0;
