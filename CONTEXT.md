@@ -62,6 +62,10 @@ _Avoid_: Request id, dedupe key, nonce
 A call to Railway that ended without a response, so the app cannot tell whether Railway acted on it.
 _Avoid_: Timeout, network error, unknown state
 
+**Timeline**:
+The record of everything the app did for one container, step by step: each request, each call to Railway and how it ended, each look before repeating a call, and what Railway reported. Kept for people to read; nothing is decided from it.
+_Avoid_: Log, history, audit trail
+
 ## Container states
 
 **Transitional state**:

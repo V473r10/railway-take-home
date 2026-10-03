@@ -283,7 +283,8 @@ export async function list(h: Harness): Promise<ContainerBody[]> {
 export type LiveEvent =
   | { type: "snapshot"; containers: ContainerBody[]; readOnly: { reason: string } | null }
   | { type: "upsert"; container: ContainerBody }
-  | { type: "remove"; id: string };
+  | { type: "remove"; id: string }
+  | { type: "timeline"; entry: { kind: string; containerId: string; operationId: string | null; [field: string]: unknown } };
 
 export type EventStream = {
   readonly events: LiveEvent[];

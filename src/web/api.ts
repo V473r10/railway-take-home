@@ -28,6 +28,28 @@ export type Container = {
   actions: Record<ContainerAction, Availability>;
 };
 
+type OperationKind = "create" | "stop" | "start" | "destroy";
+
+/** One step in a container's life, as the server records it (src/server/timeline.ts). */
+export type TimelineEntry = {
+  seq: string;
+  containerId: string;
+  operationId: string | null;
+  at: string;
+} & (
+  | { kind: "requested"; operation: OperationKind; by: "user" | "lifetime" }
+  | { kind: "began"; operation: OperationKind; resumed: boolean }
+  | { kind: "call"; call: string; attempt: number; outcome: "ok" | "rejected" | "rate_limited" | "ambiguous"; message?: string; traceId?: string | null }
+  | { kind: "lookup"; call: string; result: "acted" | "not_acted" | "unknown"; message?: string }
+  | { kind: "deployment"; deploymentId: string }
+  | { kind: "observed"; deploymentId: string; status: string; stopped: boolean }
+  | { kind: "succeeded"; operation: OperationKind }
+  | { kind: "failed"; operation: OperationKind; message: string }
+  | { kind: "unanswered"; operation: OperationKind; message: string }
+  | { kind: "missing" }
+  | { kind: "followed"; deploymentId: string }
+);
+
 /** Set while the app cannot confirm who its Railway token belongs to; every operation is refused (ADR 0003). */
 export type ReadOnlyMode = { reason: string };
 
@@ -35,7 +57,8 @@ export type LiveEvent =
   /** `readOnly` is fixed until the server restarts, so the snapshot is the only event that carries it; the limit too. */
   | { type: "snapshot"; containers: Container[]; readOnly: ReadOnlyMode | null; containerLimit: number }
   | { type: "upsert"; container: Container }
-  | { type: "remove"; id: string };
+  | { type: "remove"; id: string }
+  | { type: "timeline"; entry: TimelineEntry };
 
 /** The server answered 401: the session is missing or has expired, so show the login screen. */
 export class NotLoggedIn extends Error {}
@@ -70,7 +93,7 @@ export function subscribeToContainers(handlers: {
 }): () => void {
   const source = new EventSource("/api/events");
   const handle = (message: MessageEvent<string>) => handlers.onEvent(JSON.parse(message.data) as LiveEvent);
-  for (const type of ["snapshot", "upsert", "remove"]) source.addEventListener(type, handle);
+  for (const type of ["snapshot", "upsert", "remove", "timeline"]) source.addEventListener(type, handle);
   source.onopen = () => handlers.onConnection(true);
   source.onerror = () => {
     handlers.onConnection(false);
@@ -82,6 +105,7 @@ export function subscribeToContainers(handlers: {
 /** Apply one event to the list the UI shows, keeping creation order. */
 export function applyEvent(list: Container[] | null, event: LiveEvent): Container[] {
   if (event.type === "snapshot") return event.containers;
+  if (event.type === "timeline") return list ?? [];
   const current = list ?? [];
   if (event.type === "remove") return current.filter((c) => c.id !== event.id);
   const exists = current.some((c) => c.id === event.container.id);
@@ -111,4 +135,21 @@ export async function requestAction(containerId: string, action: ContainerAction
     headers: { "Idempotency-Key": idempotencyKey },
   });
   if (!res.ok) throw await refusal(res);
+}
+
+/** A container's timeline so far, oldest first. */
+export async function fetchTimeline(containerId: string): Promise<TimelineEntry[]> {
+  const res = await fetch(`/api/containers/${encodeURIComponent(containerId)}/timeline`);
+  if (!res.ok) throw await refusal(res);
+  return ((await res.json()) as { entries: TimelineEntry[] }).entries;
+}
+
+/**
+ * Entries from the fetch and from the live stream, each once, in order. The two overlap:
+ * an entry recorded while the fetch was in flight can arrive both ways.
+ */
+export function mergeTimeline(a: readonly TimelineEntry[], b: readonly TimelineEntry[]): TimelineEntry[] {
+  const bySeq = new Map<string, TimelineEntry>();
+  for (const entry of [...a, ...b]) bySeq.set(entry.seq, entry);
+  return [...bySeq.values()].sort((x, y) => (BigInt(x.seq) < BigInt(y.seq) ? -1 : 1));
 }

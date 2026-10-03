@@ -183,6 +183,27 @@ The tests kill the backend at each Railway call, before and after Railway acts, 
 start a second instance on the same database and fake: every case ends with exactly one
 service.
 
+### Every container has a timeline
+
+The guarantees above happen out of sight: a lost response, the look that found the
+service, the process that resumed a create are invisible on a list of containers. The
+timeline (migration `007`, `src/server/timeline.ts`) records each step as it happens:
+the request and who made it (a user, or the lifetime sweep), each attempt of each call
+to Railway by its GraphQL name and how it ended (answered, no response, rate limited,
+rejected with Railway's trace id), each look before repeating a call that may have
+acted, the deployment a Start found, each state Railway reported, and how the operation
+ended. The UI shows it under each container and keeps it current over the same SSE
+stream.
+
+- **Written beside the state, never read to decide it.** A failed write is logged and
+  dropped: a diagnostic must not be able to fail the operation it describes.
+- **Rejected: the trace as the event log the state is derived from (event sourcing).**
+  The operations table and the observed state are already the truth, guarded by
+  constraints; a second truth would have to be kept in agreement with them for no gain.
+- Because nothing checks it at runtime, the simulation does: every operation was
+  requested once and ended once in its timeline, the way the operations table says it
+  did. Removing a single write makes most seeds fail.
+
 ## Cost guards
 
 The whole app runs on a Hobby plan with USD 5 of credit, behind a public URL.
@@ -274,7 +295,7 @@ it was asked, and time runs past every lifetime.
 - **Once calm:** no operation still active; no container in a transitional state; what
   the screen says agrees with Railway (running means serving and has a URL, stopped means
   stopped, missing means gone) and each container watches its service's current
-  deployment.
+  deployment; each operation's timeline says it was requested once and ended once, as it did.
 - **Past every lifetime:** Railway holds nothing of the app's, and every foreign service
   is intact.
 

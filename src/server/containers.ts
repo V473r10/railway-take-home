@@ -4,6 +4,7 @@ import { type Db, transaction } from "./db.ts";
 import { Observer } from "./observer.ts";
 import { type Lookup, lookupFrom, withRetries } from "./retry.ts";
 import { type DeploymentPhase, phaseOf } from "./railway/deployment-phase.ts";
+import { type RailwayCall, type RequestedBy, Timeline } from "./timeline.ts";
 import {
   CONTAINER_IMAGE,
   type DeploymentState,
@@ -97,6 +98,8 @@ const TRANSITIONAL: Record<OperationKind, ContainerState> = {
   stop: "stopping",
   destroy: "destroying",
 };
+
+const SUPERSEDED_MESSAGE = "Superseded by Destroy.";
 
 const LABEL: Record<OperationKind, string> = { create: "Create", start: "Start", stop: "Stop", destroy: "Destroy" };
 
@@ -226,6 +229,7 @@ class Replay extends Error {}
 
 type BegunOperation = {
   container_id: string;
+  kind: OperationKind;
   name: string;
   service_id: string | null;
   domain: string | null;
@@ -288,9 +292,12 @@ export class ContainerControl {
   readonly #missingSweep: { done: Promise<void> | null; again: boolean } = { done: null, again: false };
   /** Containers whose deployment the observer saw go away, being re-checked. */
   readonly #suspects = new Set<string>();
+  /** What happened to each container, step by step, for people to read. */
+  readonly timeline: Timeline;
 
   constructor(deps: ContainerControlDeps) {
     this.#deps = deps;
+    this.timeline = new Timeline(deps.db, deps.clock, deps.log ?? console.error);
     this.#observer = new Observer({
       db: deps.db,
       railway: deps.railway,
@@ -447,17 +454,19 @@ export class ContainerControl {
           "UPDATE containers SET missing_at = $3 WHERE id = $1 AND service_id = $2 AND destroyed_at IS NULL AND missing_at IS NULL",
           [row.id, row.service_id, now],
         );
-        if (updated.rowCount === 0) return false;
+        if (updated.rowCount === 0) return null;
         // A Destroy in flight carries on: it knows the service is gone and just records it.
-        await client.query(
+        const failed = await client.query<{ id: string; kind: OperationKind }>(
           `UPDATE operations SET status = 'failed', last_error = $2, last_outcome_ambiguous = false, updated_at = $3
-           WHERE container_id = $1 AND kind <> 'destroy' AND status IN ('pending', 'in_progress')`,
+           WHERE container_id = $1 AND kind <> 'destroy' AND status IN ('pending', 'in_progress') RETURNING id, kind`,
           [row.id, MISSING_MESSAGE, now],
         );
-        return true;
+        return failed.rows;
       });
       if (!marked) continue;
       log(`missing: ${row.name} (${row.service_id}) is not in the sandbox project anymore`);
+      await this.timeline.record(row.id, null, { kind: "missing" });
+      for (const op of marked) await this.timeline.record(row.id, op.id, { kind: "failed", operation: op.kind, message: MISSING_MESSAGE });
       this.#observer.untrack(row.id);
       this.#publish(row.id);
     }
@@ -487,6 +496,7 @@ export class ContainerControl {
     );
     if (!rowCount) return;
     (this.#deps.log ?? console.error)(`${row.name}: deployment ${row.current_deployment_id} was replaced by ${found.deploymentId}; following it`);
+    await this.timeline.record(row.id, null, { kind: "followed", deploymentId: found.deploymentId });
     this.#observer.track(row.id);
     this.#publish(row.id);
   }
@@ -529,7 +539,7 @@ export class ContainerControl {
     );
     for (const { id, name } of rows) {
       try {
-        await this.requestAction(id, "destroy", `lifetime-${randomUUID()}`);
+        await this.requestAction(id, "destroy", `lifetime-${randomUUID()}`, "lifetime");
         log(`lifetime: destroying ${name}, created more than ${CONTAINER_LIFETIME_MS / 60_000} minutes ago`);
       } catch (error) {
         // Destroyed or being destroyed by someone else since the query above.
@@ -591,6 +601,7 @@ export class ContainerControl {
       if (error instanceof Replay) return this.#replay(idempotencyKey, "create");
       throw error;
     }
+    await this.timeline.record(containerId, operationId, { kind: "requested", operation: "create", by: "user" });
     this.#publish(containerId);
     this.#trackDrive(containerId, (signal) => this.#driveCreate(operationId, signal));
     return this.#result(operationId, false);
@@ -600,7 +611,7 @@ export class ContainerControl {
    * Record a Stop, Start or Destroy. The container row is locked first, so a
    * concurrent request for the same container waits here and then sees this one as active.
    */
-  async requestAction(containerId: string, action: ContainerAction, idempotencyKey: string): Promise<RequestResult> {
+  async requestAction(containerId: string, action: ContainerAction, idempotencyKey: string, by: RequestedBy = "user"): Promise<RequestResult> {
     this.#refuseIfReadOnly();
     const { db, clock } = this.#deps;
     const operationId = randomUUID();
@@ -637,6 +648,7 @@ export class ContainerControl {
       if (isUniqueViolation(error, "operations_one_active_destroy_per_container")) throw new ActionRefused("The container is already being destroyed.");
       throw error;
     }
+    await this.timeline.record(containerId, operationId, { kind: "requested", operation: action, by });
     this.#publish(containerId);
     if (action === "destroy") this.#track(this.#driveDestroy(operationId, containerId));
     else if (action === "stop") this.#trackDrive(containerId, (signal) => this.#driveStop(operationId, signal));
@@ -697,7 +709,7 @@ export class ContainerControl {
     let serviceId = op.service_id;
     if (!serviceId && op.resumed) {
       // The previous process may have created the service and died before recording it.
-      const found = await this.#call(operationId, () => railway.findService(op.name), { signal });
+      const found = await this.#call(operationId, () => railway.findService(op.name), { signal, containerId: op.container_id, name: "services" });
       if (found.kind !== "ok") return this.#unsuccessful(operationId, op.container_id, found, "looking for the service");
       serviceId = found.value?.serviceId ?? null;
     }
@@ -706,6 +718,8 @@ export class ContainerControl {
       // acted, look for the service by the name this operation gave it (ADR 0004).
       const created = await this.#call(operationId, () => railway.createContainer({ name: op.name, image: CONTAINER_IMAGE }), {
         signal,
+        containerId: op.container_id,
+        name: "serviceCreate",
         lookup: async () => lookupFrom(await railway.findService(op.name), (found) => (found ? done(found) : RETRY)),
       });
       if (created.kind !== "ok") return this.#unsuccessful(operationId, op.container_id, created, "creating the service");
@@ -717,7 +731,7 @@ export class ContainerControl {
 
     // The domain comes before observing, so a container is never shown running without its URL.
     if (!op.domain) {
-      const domain = await this.#domainFor(operationId, serviceId, op.resumed, signal);
+      const domain = await this.#domainFor(operationId, op.container_id, serviceId, op.resumed, signal);
       if (domain.kind === "ok") {
         await db.query("UPDATE containers SET domain = $2 WHERE id = $1", [op.container_id, domain.value.domain]);
         this.#publish(op.container_id);
@@ -730,15 +744,17 @@ export class ContainerControl {
   }
 
   /** The service's public domain: the one it has, when resuming, or a new one. */
-  async #domainFor(operationId: string, serviceId: string, resumed: boolean, signal: AbortSignal): Promise<Outcome<PublicDomain>> {
+  async #domainFor(operationId: string, containerId: string, serviceId: string, resumed: boolean, signal: AbortSignal): Promise<Outcome<PublicDomain>> {
     const { railway } = this.#deps;
     if (resumed) {
-      const found = await this.#call(operationId, () => railway.serviceDomain(serviceId), { signal });
+      const found = await this.#call(operationId, () => railway.serviceDomain(serviceId), { signal, containerId, name: "domains" });
       if (found.kind !== "ok") return found;
       if (found.value) return { kind: "ok", value: found.value };
     }
     return this.#call(operationId, () => railway.createDomain(serviceId), {
       signal,
+      containerId,
+      name: "serviceDomainCreate",
       lookup: async () => lookupFrom(await railway.serviceDomain(serviceId), (found) => (found ? done(found) : RETRY)),
     });
   }
@@ -751,7 +767,7 @@ export class ContainerControl {
    */
   async #begin(operationId: string, { clearDeployment = false, resume = false } = {}): Promise<BegunOperation | null> {
     const { db, clock } = this.#deps;
-    return transaction(db, async (client) => {
+    const op = await transaction(db, async (client) => {
       const prior = await client.query<{ status: OperationStatus }>("SELECT status FROM operations WHERE id = $1 FOR UPDATE", [operationId]);
       const status = prior.rows[0]?.status;
       const resumed = resume && status === "in_progress";
@@ -759,7 +775,7 @@ export class ContainerControl {
       const { rows } = await client.query<Omit<BegunOperation, "resumed">>(
         `UPDATE operations o SET status = 'in_progress', attempts = attempts + 1, updated_at = $2
          FROM containers c WHERE o.id = $1 AND c.id = o.container_id
-         RETURNING o.container_id, c.name, c.service_id, c.domain, c.current_deployment_id AS deployment_id, o.replaced_deployment_id,
+         RETURNING o.container_id, o.kind, c.name, c.service_id, c.domain, c.current_deployment_id AS deployment_id, o.replaced_deployment_id,
                    c.missing_at IS NOT NULL AS missing`,
         [operationId, clock.now()],
       );
@@ -774,6 +790,8 @@ export class ContainerControl {
       if (clearDeployment && !recordedNew) await client.query("UPDATE containers SET current_deployment_id = NULL WHERE id = $1", [op.container_id]);
       return op;
     });
+    if (op) await this.timeline.record(op.container_id, operationId, { kind: "began", operation: op.kind, resumed: op.resumed });
+    return op;
   }
 
   /**
@@ -788,13 +806,15 @@ export class ContainerControl {
     const deploymentId = op.deployment_id;
     if (!deploymentId) return this.#failAndPublish(operationId, op.container_id, "The container has no deployment to stop.");
     if (op.resumed) {
-      const seen = await this.#call(operationId, () => railway.readDeployment(deploymentId), { signal });
+      const seen = await this.#call(operationId, () => railway.readDeployment(deploymentId), { signal, containerId: op.container_id, name: "deployment" });
       if (seen.kind !== "ok") return this.#unsuccessful(operationId, op.container_id, seen, "reading the deployment");
       // The previous process's stop did act: storing what was read completes the Stop.
       if (seen.value.stopped) return this.#confirmStopped(operationId, op.container_id, deploymentId);
     }
     const stopped = await this.#call(operationId, () => railway.stopDeployment(deploymentId), {
       signal,
+      containerId: op.container_id,
+      name: "deploymentStop",
       lookup: async () => lookupFrom(await railway.readDeployment(deploymentId), (state) => (state.stopped ? done(undefined) : RETRY)),
     });
     if (stopped.kind !== "ok") return this.#unsuccessful(operationId, op.container_id, stopped, "stopping the deployment");
@@ -847,7 +867,7 @@ export class ContainerControl {
     if (!op.domain) {
       // Railway refused the domain when the container was created. A container is never
       // brought online without its URL (found by the simulation, seed 66): get it first.
-      const domain = await this.#domainFor(operationId, serviceId, true, signal);
+      const domain = await this.#domainFor(operationId, op.container_id, serviceId, true, signal);
       if (domain.kind !== "ok") {
         await restore();
         // Not left active when unanswered: the next Start looks for the domain before making one.
@@ -871,6 +891,8 @@ export class ContainerControl {
     // A redeploy that acted shows up as a newer deployment; only without one is it repeated.
     const redeployed = await this.#call(operationId, () => railway.redeployService(serviceId), {
       signal,
+      containerId: op.container_id,
+      name: "serviceInstanceRedeploy",
       lookup: async () =>
         lookupFrom(await railway.latestDeployment(serviceId), (latest) =>
           latest && latest.deploymentId !== replaced ? done(undefined) : RETRY,
@@ -908,6 +930,7 @@ export class ContainerControl {
       // A new deployment exists, so an ambiguous redeploy did happen.
       await client.query("UPDATE operations SET last_outcome_ambiguous = false, last_error = NULL WHERE id = $1", [operationId]);
     });
+    await this.timeline.record(containerId, operationId, { kind: "deployment", deploymentId: found.deploymentId });
     this.#publish(containerId);
     this.#observer.track(containerId);
   }
@@ -953,11 +976,14 @@ export class ContainerControl {
     }
     const op = await this.#begin(operationId, { resume });
     if (!op) return;
-    await db.query(
-      `UPDATE operations SET status = 'failed', last_error = 'Superseded by Destroy.', updated_at = $2
-       WHERE container_id = $1 AND kind <> 'destroy' AND status IN ('pending', 'in_progress')`,
-      [containerId, clock.now()],
+    const superseded = await db.query<{ id: string; kind: OperationKind }>(
+      `UPDATE operations SET status = 'failed', last_error = $3, updated_at = $2
+       WHERE container_id = $1 AND kind <> 'destroy' AND status IN ('pending', 'in_progress') RETURNING id, kind`,
+      [containerId, clock.now(), SUPERSEDED_MESSAGE],
     );
+    for (const prior of superseded.rows) {
+      await this.timeline.record(containerId, prior.id, { kind: "failed", operation: prior.kind, message: SUPERSEDED_MESSAGE });
+    }
     this.#observer.untrack(containerId);
 
     // A missing container's service is already gone: there is nothing to delete, only the row to close.
@@ -968,7 +994,11 @@ export class ContainerControl {
     // when the create was flagged ambiguous is not enough: a resumed create whose own
     // lookup was refused clears no doubt, and its service was orphaned (simulation, seed 60).
     if (!op.missing && (op.resumed || !serviceId)) {
-      const found = await this.#call(operationId, () => railway.findService(op.name), { signal: this.#closing.signal });
+      const found = await this.#call(operationId, () => railway.findService(op.name), {
+        signal: this.#closing.signal,
+        containerId,
+        name: "services",
+      });
       if (found.kind !== "ok") {
         this.#observer.track(containerId);
         return this.#unsuccessful(operationId, containerId, found, "looking for the service");
@@ -980,6 +1010,8 @@ export class ContainerControl {
       // A delete that acted leaves no service with the container's name; only then is it not repeated.
       const deleted = await this.#call(operationId, () => railway.deleteService(target), {
         signal: this.#closing.signal,
+        containerId,
+        name: "serviceDelete",
         lookup: async () => lookupFrom(await railway.findService(op.name), (found) => (found ? RETRY : done(undefined))),
       });
       if (deleted.kind !== "ok") {
@@ -991,6 +1023,7 @@ export class ContainerControl {
       await client.query("UPDATE containers SET destroyed_at = $2 WHERE id = $1", [containerId, clock.now()]);
       await client.query("UPDATE operations SET status = 'succeeded', updated_at = $2 WHERE id = $1", [operationId, clock.now()]);
     });
+    await this.timeline.record(containerId, operationId, { kind: "succeeded", operation: "destroy" });
     this.#publish(containerId);
   }
 
@@ -1017,10 +1050,12 @@ export class ContainerControl {
       case "ambiguous":
         // Railway may have acted and every retry went unanswered. Leave the operation active
         // and flagged, so the startup reconciler can resolve it instead of guessing.
-        await this.#deps.db.query(
-          "UPDATE operations SET last_outcome_ambiguous = true, last_error = $2, updated_at = $3 WHERE id = $1",
-          [operationId, `No response from Railway while ${step}: ${outcome.reason}`, this.#deps.clock.now()],
+        const message = `No response from Railway while ${step}: ${outcome.reason}`;
+        const { rows } = await this.#deps.db.query<{ kind: OperationKind; status: OperationStatus }>(
+          "UPDATE operations SET last_outcome_ambiguous = true, last_error = $2, updated_at = $3 WHERE id = $1 RETURNING kind, status",
+          [operationId, message, this.#deps.clock.now()],
         );
+        if (rows[0] && isActive(rows[0].status)) await this.timeline.record(containerId, operationId, { kind: "unanswered", operation: rows[0].kind, message });
         break;
     }
     this.#publish(containerId);
@@ -1034,7 +1069,7 @@ export class ContainerControl {
   async #onObserved(containerId: string, state: DeploymentState, changed: boolean): Promise<void> {
     const { db, clock } = this.#deps;
     const phase = phaseOf(state, this.#deps.log);
-    let settled = 0;
+    let settled: Array<{ id: string; kind: OperationKind; status: OperationStatus; last_error: string | null }> = [];
     if (phase === "serving" || phase === "stopped") {
       const kinds = phase === "stopped" ? ["stop"] : ["create", "start"];
       // A serving deployment completes a Create or Start only once the container has its URL:
@@ -1042,19 +1077,31 @@ export class ContainerControl {
       const result = await db.query(
         `UPDATE operations o SET status = 'succeeded', updated_at = $2
          WHERE o.container_id = $1 AND o.kind = ANY($3) AND o.status = 'in_progress'
-           AND (o.kind = 'stop' OR EXISTS (SELECT 1 FROM containers c WHERE c.id = o.container_id AND c.domain IS NOT NULL))`,
+           AND (o.kind = 'stop' OR EXISTS (SELECT 1 FROM containers c WHERE c.id = o.container_id AND c.domain IS NOT NULL))
+         RETURNING o.id, o.kind, o.status, o.last_error`,
         [containerId, clock.now(), kinds],
       );
-      settled = result.rowCount ?? 0;
+      settled = result.rows;
     } else if (phase === "down" || phase === "going-away") {
       const result = await db.query(
         `UPDATE operations SET status = 'failed', last_error = $2, updated_at = $3
-         WHERE container_id = $1 AND kind IN ('create', 'start', 'stop') AND status = 'in_progress'`,
+         WHERE container_id = $1 AND kind IN ('create', 'start', 'stop') AND status = 'in_progress'
+         RETURNING id, kind, status, last_error`,
         [containerId, `Railway reports the deployment as ${state.status}.`, clock.now()],
       );
-      settled = result.rowCount ?? 0;
+      settled = result.rows;
     }
-    if (changed || settled > 0) this.#publish(containerId);
+    if (changed) {
+      await this.timeline.record(containerId, null, { kind: "observed", deploymentId: state.deploymentId, status: state.status, stopped: state.stopped });
+    }
+    for (const op of settled) {
+      await this.timeline.record(
+        containerId,
+        op.id,
+        op.status === "succeeded" ? { kind: "succeeded", operation: op.kind } : { kind: "failed", operation: op.kind, message: op.last_error ?? "" },
+      );
+    }
+    if (changed || settled.length > 0) this.#publish(containerId);
   }
 
   /**
@@ -1065,14 +1112,31 @@ export class ContainerControl {
   async #call<T>(
     operationId: string,
     call: () => Promise<Outcome<T>>,
-    options: { signal: AbortSignal; lookup?: () => Promise<Lookup<T>> },
+    options: { signal: AbortSignal; lookup?: () => Promise<Lookup<T>>; containerId: string; name: RailwayCall },
   ): Promise<Outcome<T>> {
     const { db, clock } = this.#deps;
+    const { containerId, name } = options;
     let flagged = false;
     const outcome = await withRetries(call, {
       clock,
       signal: options.signal,
       lookup: options.lookup,
+      onAttempt: (attempt, n) =>
+        this.timeline.record(containerId, operationId, {
+          kind: "call",
+          call: name,
+          attempt: n,
+          outcome: attempt.kind,
+          ...(attempt.kind === "rejected" ? { message: attempt.message, traceId: attempt.traceId } : {}),
+          ...(attempt.kind === "ambiguous" ? { message: attempt.reason } : {}),
+        }),
+      onLookup: (seen) =>
+        this.timeline.record(containerId, operationId, {
+          kind: "lookup",
+          call: name,
+          result: seen.kind === "done" ? "acted" : seen.kind === "retry" ? "not_acted" : "unknown",
+          ...(seen.kind === "unknown" ? { message: seen.reason } : {}),
+        }),
       onAmbiguous: async () => {
         if (flagged) return;
         flagged = true;
@@ -1097,10 +1161,13 @@ export class ContainerControl {
 
   async #fail(operationId: string, message: string, traceId: string | null): Promise<void> {
     // Only an active operation can fail; one the observer already settled stays settled.
-    await this.#deps.db.query(
-      "UPDATE operations SET status = 'failed', last_error = $2, last_trace_id = $3, updated_at = $4 WHERE id = $1 AND status IN ('pending', 'in_progress')",
+    const { rows } = await this.#deps.db.query<{ container_id: string; kind: OperationKind }>(
+      `UPDATE operations SET status = 'failed', last_error = $2, last_trace_id = $3, updated_at = $4
+       WHERE id = $1 AND status IN ('pending', 'in_progress') RETURNING container_id, kind`,
       [operationId, message, traceId, this.#deps.clock.now()],
     );
+    const op = rows[0];
+    if (op) await this.timeline.record(op.container_id, operationId, { kind: "failed", operation: op.kind, message });
   }
 
   #track(work: Promise<void>): Promise<void> {
