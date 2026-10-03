@@ -59,7 +59,12 @@ describe("chaos mode", () => {
     expect(h.railway.callsTo("createContainer")).toHaveLength(1);
     expect(h.railway.services.size).toBe(1);
     expect(await (await h.request("/api/chaos")).json()).toEqual({ enabled: true, armed: null });
-    const kinds = (await timeline(body.container.id)).map((e) => (e.kind === "call" ? `${String(e.call)} ${String(e.outcome)}` : e.kind));
+    // The observer writes "observed" entries on its own schedule; under CPU
+    // starvation one can land before this read. This test is about the
+    // operation's path, so it reads only the operation's entries.
+    const kinds = (await timeline(body.container.id))
+      .filter((e) => e.kind !== "observed")
+      .map((e) => (e.kind === "call" ? `${String(e.call)} ${String(e.outcome)}` : e.kind));
     expect(kinds).toEqual(["requested", "began", "chaos", "serviceCreate ambiguous", "lookup", "serviceDomainCreate ok"]);
   });
 
