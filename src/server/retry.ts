@@ -23,14 +23,20 @@ export type RetryOptions<T> = {
   lookup?: () => Promise<Lookup<T>>;
   /** Told of every ambiguous attempt, so the operation is flagged while Railway's answer is unknown. */
   onAmbiguous?: (reason: string) => Promise<void>;
+  /** Told how each call ended, numbered from 1 (the timeline). */
+  onAttempt?: (outcome: Outcome<T>, call: number) => Promise<void>;
+  /** Told what each look before a repeat found. */
+  onLookup?: (seen: Lookup<T>) => Promise<void>;
   /** Ends the waiting early; the last outcome is returned as it is. */
   signal?: AbortSignal;
 };
 
 /** Run one call to Railway under the retry policy and return its final outcome. */
 export async function withRetries<T>(call: () => Promise<Outcome<T>>, options: RetryOptions<T>): Promise<Outcome<T>> {
-  const { clock, lookup, onAmbiguous, signal } = options;
+  const { clock, lookup, onAmbiguous, onAttempt, onLookup, signal } = options;
+  let calls = 1;
   let outcome = await call();
+  await onAttempt?.(outcome, calls);
   let backoff = RETRY_BACKOFF_MS;
   for (let attempt = 1; ; attempt++) {
     if (outcome.kind === "ok" || outcome.kind === "rejected") return outcome;
@@ -45,6 +51,7 @@ export async function withRetries<T>(call: () => Promise<Outcome<T>>, options: R
 
     if (outcome.kind === "ambiguous" && lookup) {
       const seen = await lookup();
+      await onLookup?.(seen);
       if (seen.kind === "done") return seen.outcome;
       if (seen.kind === "unknown") {
         // Still not known whether the call acted: look again next time instead of repeating it.
@@ -53,6 +60,7 @@ export async function withRetries<T>(call: () => Promise<Outcome<T>>, options: R
       }
     }
     outcome = await call();
+    await onAttempt?.(outcome, ++calls);
   }
 }
 

@@ -1,10 +1,13 @@
 import { CONTAINER_LIMIT, type ContainerControl, type ContainerView, type ReadOnlyMode } from "./containers.ts";
+import type { TimelineEntry } from "./timeline.ts";
 
 export type LiveEvent =
   /** The whole list, sent once when a client connects (or reconnects), with the app's read-only mode and container limit. */
   | { type: "snapshot"; containers: ContainerView[]; readOnly: ReadOnlyMode | null; containerLimit: number }
   | { type: "upsert"; container: ContainerView }
-  | { type: "remove"; id: string };
+  | { type: "remove"; id: string }
+  /** A new step in one container's timeline. A client that shows the timeline fetches it first, then appends these. */
+  | { type: "timeline"; entry: TimelineEntry };
 
 type Client = { send: (event: LiveEvent) => void; open: boolean };
 
@@ -30,6 +33,8 @@ export class LiveFeed {
         this.#broadcast(container ? { type: "upsert", container } : { type: "remove", id });
       }),
     );
+    // Queued with the changes, so a client receives entries and changes in the order they happened.
+    control.timeline.onEntry((entry) => this.#enqueue(async () => this.#broadcast({ type: "timeline", entry })));
   }
 
   /** Send the current list, then every change after it. Returns the function that disconnects. */

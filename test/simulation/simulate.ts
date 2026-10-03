@@ -481,6 +481,26 @@ class Simulation {
   }
 
   /** Once calm: nothing is left half done, and the screen shows what Railway has. */
+  /**
+   * The timeline tells the truth: every operation was requested once and ended once,
+   * the way the operations table says it did. Nothing decides from the timeline, so
+   * only a check like this one keeps it from drifting away from what really happened.
+   */
+  async #checkTimeline(): Promise<void> {
+    const { rows } = await this.#h.db.query<{ id: string; kind: string; status: string; container_id: string; requested: number; ends: string[] }>(
+      `SELECT o.id, o.kind, o.status, o.container_id,
+              count(*) FILTER (WHERE t.kind = 'requested')::int AS requested,
+              coalesce(array_agg(t.kind ORDER BY t.seq) FILTER (WHERE t.kind IN ('succeeded', 'failed')), '{}') AS ends
+       FROM operations o LEFT JOIN timeline_entries t ON t.operation_id = o.id
+       GROUP BY o.id`,
+    );
+    for (const op of rows) {
+      const where = `${op.kind} on ${this.#alias(op.container_id)} (${op.status})`;
+      if (op.requested !== 1) throw new Error(`timeline: ${where} was requested ${op.requested} times`);
+      if (op.ends.length !== 1 || op.ends[0] !== op.status) throw new Error(`timeline: ${where} ended as [${op.ends.join(", ")}]`);
+    }
+  }
+
   async checkLiveness(): Promise<void> {
     const h = this.#h;
     const { rows: active } = await h.db.query<{ kind: string; container_id: string; last_error: string | null }>(
@@ -509,6 +529,7 @@ class Simulation {
         throw new Error(`${where} and watches deployment ${row?.current_deployment_id}, but Railway's current one is ${service.deploymentId}`);
       }
     }
+    await this.#checkTimeline();
     this.#log(`liveness ok: ${containers.length} container(s), ${containers.map((c) => `${this.#alias(c.id)}=${c.state}`).join(" ")}`);
   }
 

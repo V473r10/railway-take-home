@@ -57,6 +57,15 @@ export function createApp({ control, gate, webRoot, log }: AppDeps): Hono {
     }),
   );
 
+  // Everything the app did for one container, oldest first; live updates come over /api/events.
+  app.get("/api/containers/:id/timeline", async (c) => {
+    const id = c.req.param("id");
+    if (!UUID.test(id)) return c.json({ error: "No such container." }, 404);
+    const entries = await control.timeline.list(id);
+    if (!entries) return c.json({ error: "No such container." }, 404);
+    return c.json({ entries });
+  });
+
   app.post("/api/containers", async (c) => {
     const key = c.req.header("Idempotency-Key");
     if (!key || !IDEMPOTENCY_KEY.test(key)) {

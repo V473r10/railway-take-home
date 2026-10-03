@@ -1,16 +1,22 @@
-import { type FormEvent, useCallback, useEffect, useState } from "react";
+import { type FormEvent, Fragment, useCallback, useEffect, useRef, useState } from "react";
 import {
   applyEvent,
   type Container,
   type ContainerAction,
   createContainer,
+  fetchTimeline,
   hasSession,
   logIn,
+  mergeTimeline,
   NotLoggedIn,
   type ReadOnlyMode,
   requestAction,
   subscribeToContainers,
+  type TimelineEntry,
 } from "./api.ts";
+import { Timeline } from "./Timeline.tsx";
+
+type OpenTimeline = { entries: TimelineEntry[]; loading: boolean; error: string | null };
 
 const RECHECK_MS = 2_000;
 const ACTION_LABEL: Record<ContainerAction, string> = { stop: "Stop", start: "Start", destroy: "Destroy" };
@@ -178,6 +184,36 @@ function Containers({ onStreamClosed, onSessionEnded }: { onStreamClosed: () => 
   const [creating, setCreating] = useState(false);
   // Containers with a Stop or Start request on its way to the server.
   const [sending, setSending] = useState<ReadonlySet<string>>(new Set());
+  // The timelines on screen, by container. Fetched when opened, then kept current from the live stream.
+  const [timelines, setTimelines] = useState<Readonly<Record<string, OpenTimeline>>>({});
+  const openTimelines = useRef<ReadonlySet<string>>(new Set());
+
+  const loadTimeline = useCallback(
+    (id: string) => {
+      setTimelines((t) => ({ ...t, [id]: { entries: t[id]?.entries ?? [], loading: true, error: null } }));
+      fetchTimeline(id).then(
+        (entries) =>
+          setTimelines((t) => (t[id] ? { ...t, [id]: { entries: mergeTimeline(t[id].entries, entries), loading: false, error: null } } : t)),
+        (e: unknown) => {
+          if (e instanceof NotLoggedIn) return onSessionEnded();
+          setTimelines((t) => (t[id] ? { ...t, [id]: { ...t[id], loading: false, error: e instanceof Error ? e.message : String(e) } } : t));
+        },
+      );
+    },
+    [onSessionEnded],
+  );
+
+  const toggleTimeline = (id: string) => {
+    const next = new Set(openTimelines.current);
+    if (next.has(id)) {
+      next.delete(id);
+      setTimelines(({ [id]: _closed, ...rest }) => rest);
+    } else {
+      next.add(id);
+      loadTimeline(id);
+    }
+    openTimelines.current = next;
+  };
 
   useEffect(
     () =>
@@ -186,13 +222,23 @@ function Containers({ onStreamClosed, onSessionEnded }: { onStreamClosed: () => 
           if (event.type === "snapshot") {
             setReadOnly(event.readOnly);
             setContainerLimit(event.containerLimit);
+            // Entries recorded while the stream was down never arrived: fetch what is open again.
+            for (const id of openTimelines.current) loadTimeline(id);
+          }
+          if (event.type === "timeline") {
+            const { entry } = event;
+            setTimelines((t) => {
+              const open = t[entry.containerId];
+              return open ? { ...t, [entry.containerId]: { ...open, entries: mergeTimeline(open.entries, [entry]) } } : t;
+            });
+            return;
           }
           setContainers((list) => applyEvent(list, event));
         },
         onConnection: setConnected,
         onClosed: onStreamClosed,
       }),
-    [onStreamClosed],
+    [onStreamClosed, loadTimeline],
   );
 
   const onCreate = async () => {
@@ -291,46 +337,70 @@ function Containers({ onStreamClosed, onSessionEnded }: { onStreamClosed: () => 
             </tr>
           </thead>
           <tbody aria-live="polite">
-            {containers.map((c) => (
-              <tr key={c.id}>
-                <td>
-                  <code>{c.name}</code>
-                </td>
-                <td>
-                  <span className={`state state-${c.state}`}>{c.state}</span>
-                  {c.lastError && (
-                    <div className="error">
-                      {c.lastError.message}
-                      {c.lastError.traceId && <small> (trace {c.lastError.traceId})</small>}
-                    </div>
+            {containers.map((c) => {
+              const timeline = timelines[c.id];
+              return (
+                <Fragment key={c.id}>
+                  <tr>
+                    <td>
+                      <code>{c.name}</code>
+                      <div>
+                        <button
+                          type="button"
+                          className="link"
+                          aria-expanded={timeline !== undefined}
+                          aria-controls={`timeline-${c.id}`}
+                          onClick={() => toggleTimeline(c.id)}
+                        >
+                          {timeline ? "Hide timeline" : "Timeline"}
+                          <span className="visually-hidden"> of {c.name}</span>
+                        </button>
+                      </div>
+                    </td>
+                    <td>
+                      <span className={`state state-${c.state}`}>{c.state}</span>
+                      {c.lastError && (
+                        <div className="error">
+                          {c.lastError.message}
+                          {c.lastError.traceId && <small> (trace {c.lastError.traceId})</small>}
+                        </div>
+                      )}
+                    </td>
+                    <td>
+                      {c.state === "running" && c.url ? (
+                        <a href={c.url} target="_blank" rel="noopener noreferrer">
+                          {new URL(c.url).host}
+                          <span className="visually-hidden"> (opens in a new tab)</span>
+                        </a>
+                      ) : (
+                        <span aria-label="Not available">—</span>
+                      )}
+                    </td>
+                    <td>
+                      <time dateTime={c.createdAt}>{new Date(c.createdAt).toLocaleTimeString()}</time>
+                    </td>
+                    <td>
+                      <Countdown expiresAt={c.expiresAt} now={now} />
+                    </td>
+                    <td>
+                      <ContainerActions
+                        container={c}
+                        sending={sending.has(c.id)}
+                        readOnly={readOnly !== null}
+                        onAction={(action) => void onAction(c.id, action)}
+                      />
+                    </td>
+                  </tr>
+                  {timeline && (
+                    <tr id={`timeline-${c.id}`} className="timeline-row">
+                      <td colSpan={6}>
+                        <Timeline {...timeline} />
+                      </td>
+                    </tr>
                   )}
-                </td>
-                <td>
-                  {c.state === "running" && c.url ? (
-                    <a href={c.url} target="_blank" rel="noopener noreferrer">
-                      {new URL(c.url).host}
-                      <span className="visually-hidden"> (opens in a new tab)</span>
-                    </a>
-                  ) : (
-                    <span aria-label="Not available">—</span>
-                  )}
-                </td>
-                <td>
-                  <time dateTime={c.createdAt}>{new Date(c.createdAt).toLocaleTimeString()}</time>
-                </td>
-                <td>
-                  <Countdown expiresAt={c.expiresAt} now={now} />
-                </td>
-                <td>
-                  <ContainerActions
-                    container={c}
-                    sending={sending.has(c.id)}
-                    readOnly={readOnly !== null}
-                    onAction={(action) => void onAction(c.id, action)}
-                  />
-                </td>
-              </tr>
-            ))}
+                </Fragment>
+              );
+            })}
           </tbody>
         </table>
       )}
