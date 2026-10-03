@@ -40,6 +40,19 @@ async function stopped(): Promise<{ id: string; serviceId: string }> {
   return c;
 }
 
+/** Wait for every operation to settle, moving the clock whenever the app is waiting on it. */
+async function settledWhileTimePasses(): Promise<void> {
+  let done = false;
+  const settled = h.settled().then(() => {
+    done = true;
+  });
+  await eventually(() => {
+    if (!done && h.clock.sleepers > 0) h.clock.advance(1_000);
+    return done;
+  });
+  await settled;
+}
+
 /** Kill the backend on its next call to `method`, after sending the request that makes it. */
 async function killDuring(method: Parameters<Harness["dieOn"]>[0], when: DeathPoint, request: () => Promise<Response>): Promise<string> {
   h.dieOn(method, when);
@@ -82,6 +95,24 @@ describe("a create interrupted by a restart", () => {
     expect(h.railway.callsTo("findService")).toHaveLength(0);
     const [container] = await list(h);
     expect(container?.url).toBe(`https://${container?.name}.up.railway.app`);
+  });
+
+  // Found by the simulation (seed 60): the resumed create's lookup was refused, so the
+  // service the dead instance made was never recorded, and the Destroy that followed
+  // (the lifetime's) closed the container without looking: the service was orphaned.
+  it("killed after serviceCreate, then the lookup is refused: a Destroy still deletes the service", async () => {
+    await killDuring("createContainer", "after_acting", () => create(h));
+    await h.restart((railway) => railway.failNextOn("findService", { kind: "rejected", message: "lookup refused" }));
+    await h.settled();
+    const [container] = await list(h);
+    expect(container).toMatchObject({ state: "failed", serviceId: null });
+    expect(h.railway.services.size).toBe(1);
+
+    expect((await action(h, container?.id ?? "", "destroy")).status).toBe(202);
+    await h.settled();
+
+    expect(await list(h)).toEqual([]);
+    expect(h.railway.services.size).toBe(0);
   });
 
   it("refuses a Stop while the resumed create is still running", async () => {
@@ -133,7 +164,8 @@ describe("a Start interrupted by a restart", () => {
     const operationId = await killDuring("redeployService", when, () => action(h, id, "start"));
 
     await h.restart();
-    await h.settled();
+    // A resumed Start looks for its new deployment a few times, with backoff, before redeploying.
+    await settledWhileTimePasses();
 
     expect(h.railway.callsTo("redeployService")).toHaveLength(1);
     const current = h.railway.services.get(serviceId)?.deploymentId;
@@ -141,6 +173,28 @@ describe("a Start interrupted by a restart", () => {
     const { rows } = await h.db.query<{ current_deployment_id: string | null }>("SELECT current_deployment_id FROM containers WHERE id = $1", [id]);
     expect(rows[0]?.current_deployment_id).toBe(current);
 
+    h.railway.setDeployment(serviceId, "SUCCESS");
+    await eventually(async () => (await stateOf(id)) === "running");
+    expect(await operationStatus(operationId)).toBe("succeeded");
+  });
+
+  // Found by the simulation (seed 10): with the list lagging, the resumed Start took the
+  // replaced deployment as proof its redeploy had not acted, redeployed again, and then
+  // adopted the deployment that second redeploy removed, watching it forever.
+  it("killed after the redeploy while Railway still lists the replaced deployment: does not redeploy again", async () => {
+    const { id, serviceId } = await stopped();
+    const operationId = await killDuring("redeployService", "after_acting", () => action(h, id, "start"));
+    h.railway.lagNewDeployments(3);
+
+    await h.restart();
+    // The resumed Start looks again with backoff while the list lags.
+    await eventually(async () => {
+      if (h.clock.sleepers > 0) h.clock.advance(5_000);
+      const { rows } = await h.db.query<{ current_deployment_id: string | null }>("SELECT current_deployment_id FROM containers WHERE id = $1", [id]);
+      return rows[0]?.current_deployment_id === h.railway.services.get(serviceId)?.deploymentId;
+    });
+
+    expect(h.railway.callsTo("redeployService")).toHaveLength(1);
     h.railway.setDeployment(serviceId, "SUCCESS");
     await eventually(async () => (await stateOf(id)) === "running");
     expect(await operationStatus(operationId)).toBe("succeeded");

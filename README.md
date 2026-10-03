@@ -72,6 +72,8 @@ Node 24 or newer, and a Postgres for the tests (CI uses a Postgres service).
 npm ci
 npm run test:local                 # starts a throwaway Postgres in .scratch/, then runs the suite
 npx vitest run test/reconcile.test.ts   # one file, once the cluster is up (scripts/test-db.sh)
+SIM_SEEDS=500 npx vitest run test/simulation.test.ts   # the seeded simulation, 500 seeds (CI runs 10)
+SIM_SEED=60 npx vitest run test/simulation.test.ts     # replay one seed, with its full trace on failure
 npm run typecheck && npm run build
 RAILWAY_FAKE=1 DATABASE_URL=... APP_PASSWORD=... SESSION_SECRET=... npm run dev
 ```

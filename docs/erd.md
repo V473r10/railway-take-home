@@ -256,7 +256,45 @@ see: responses, SSE events and the calls the fake recorded.
   triggered at will, and every run spends the rate limit and the credit.
 - **Rejected: UI tests.** The UI renders what SSE delivers; the logic is in the backend.
 
-126 tests, run five times in a row without flakes before each merge. Key tests were
+### Seeded simulation
+
+The tests above check the failures someone thought of. `test/simulation.test.ts` looks
+for the ones nobody did: one seed drives 80 random steps against the same harness
+(users clicking, double clicking, clicking concurrently and replaying old keys; Railway
+losing responses before and after acting, rate limiting and refusing; the backend dying
+on any call and restarting, sometimes with an unconfirmed token; deployments failing and
+crashing; services deleted from the dashboard, foreign services appearing, sockets
+dropping, time jumping up to 10 minutes). Then the failures stop, Railway finishes what
+it was asked, and time runs past every lifetime.
+
+- **After every step:** no two services with one name (no duplicate); every service the
+  app made belongs to a live container (no orphan); never more than 5 containers; never
+  a call that changes a service the app did not create; never a 500; the same key always
+  answers with the same operation.
+- **Once calm:** no operation still active; no container in a transitional state; what
+  the screen says agrees with Railway (running means serving and has a URL, stopped means
+  stopped, missing means gone) and each container watches its service's current
+  deployment.
+- **Past every lifetime:** Railway holds nothing of the app's, and every foreign service
+  is intact.
+
+The steps are a pure function of the seed, so a failure prints its seed and trace, and
+`SIM_SEED=<n>` replays it. Postgres is real, so the interleaving inside a step can vary
+between runs; every finding below replayed from its seed. CI runs 10 seeds (about 25 s).
+Before merging, 800 seeds ran: 401 to 800 clean on the final code; 1 to 400 on the code
+before the last fix, where the only failures were that fix's bug (seeds 138, 262, 381),
+which replay clean now.
+
+**What it found**, each now a regular test that failed before its fix:
+
+| Seed | What happened | Fix |
+| --- | --- | --- |
+| 60 | A create died after Railway acted; its resumed lookup was refused, so the service was never recorded. The Destroy that followed looked Railway up only when the create was flagged ambiguous, and the flag had been cleared: **an orphaned service**. | A Destroy of a container with no service recorded always looks it up by name. |
+| 10 | A Start's process died after its redeploy acted; Railway still listed the replaced deployment, so the resumed Start redeployed again, then adopted the deployment that second redeploy removed, and watched it forever. | A resumed Start looks for its new deployment a few times before redeploying; a container whose deployment went away while its service lives on follows the service's newest one (a redeploy from Railway's dashboard did the same). |
+| 66 | Railway refused the domain during the create; a later Start brought the container up, and it showed **running with no URL**. | A Start gets the domain first. |
+| 138 | The domain went unanswered; the observer saw the deployment succeed and completed the Create anyway: **running with no URL**. | A serving deployment completes a Create or Start only once the container has its URL. |
+
+150 tests and 10 simulation seeds, run five times in a row without flakes before each merge. Key tests were
 checked by breaking the code on purpose (removing the name lookup, the advisory lock,
 the reconciler, the boot sweep) and watching them fail. A manual smoke test against real
 Railway (create, running, open the URL, stop, start, destroy) is recorded in the README;
@@ -265,7 +303,11 @@ its first run found the Stop bug above.
 ## Known limitations
 
 - A Start whose redeploy acted but whose new deployment Railway does not list yet can be
-  repeated: one extra deployment, never an extra service.
+  repeated: one extra deployment, never an extra service. A resumed Start now looks four
+  times before redeploying; an ambiguous redeploy in a live process still looks once.
+- An operation whose last call went unanswered after every retry stays active until the
+  next boot's reconciler resolves it (the container shows its transitional state), or
+  until a Destroy or the lifetime ends it.
 - One instance only (ADR 0001).
 - The app is deployed with `railway up`; Railway's GitHub app has no access to the
   repository, so a merge does not redeploy.

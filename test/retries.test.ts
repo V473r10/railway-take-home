@@ -188,6 +188,26 @@ describe("retries of the other calls", () => {
     expect((await list(h))[0]?.url).toMatch(/^https:\/\/rcc-/);
   });
 
+  // Found by the simulation (seed 138): the domain went unanswered, the observer saw the
+  // deployment succeed and completed the Create, and the container showed running with no URL.
+  it("does not complete a create whose domain went unanswered: it waits for the reconciler", async () => {
+    h.railway.failNextOn("createDomain", ...Array.from({ length: MAX_ATTEMPTS }, () => ({ kind: "ambiguous_before_acting" as const })));
+    const body = (await (await create(h)).json()) as CreateBody;
+    for (let i = 0; i < MAX_ATTEMPTS - 1; i++) await elapse(30_000);
+    await eventually(() => h.railway.callsTo("createDomain").length === MAX_ATTEMPTS);
+    await h.settled();
+    const [serviceId] = h.railway.services.keys();
+    await eventually(() => h.railway.callsTo("readDeployment").length > 0);
+    h.railway.setDeployment(serviceId ?? "", "SUCCESS");
+    await quiet();
+    expect((await list(h))[0]).toMatchObject({ state: "creating", url: null });
+
+    await h.restart();
+    await h.settled();
+    await eventually(async () => (await list(h))[0]?.state === "running");
+    expect((await list(h))[0]?.url).toBe(`https://${body.container.name}.up.railway.app`);
+  });
+
   it("repeats a Stop that never reached Railway", async () => {
     const { id, serviceId } = await running();
     h.railway.failNextOn("stopDeployment", { kind: "ambiguous_before_acting" });

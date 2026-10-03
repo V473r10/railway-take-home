@@ -34,6 +34,8 @@ export type Harness = {
   events: () => Promise<EventStream>;
   /** Kill the backend process on its next call to `method`, before or after Railway acts on it. */
   dieOn: (method: FakeMutation, when: DeathPoint) => void;
+  /** Forget a death `dieOn` arranged that has not happened yet. */
+  spare: () => void;
   /** Whether the current backend process has died. */
   readonly dead: boolean;
   /**
@@ -60,7 +62,7 @@ export async function startHarness(): Promise<Harness> {
   url.pathname = `/${name}`;
   const railway = new FakeRailway();
   const clock = new ManualClock();
-  const log = () => {};
+  const log = process.env.HARNESS_LOG ? (msg: string) => void process.stderr.write(`[app] ${msg}\n`) : () => {};
   const pools: Db[] = [];
   const gate = { password: TEST_PASSWORD, secret: TEST_SESSION_SECRET, secureCookie: false, clock };
 
@@ -122,6 +124,7 @@ export async function startHarness(): Promise<Harness> {
       return stream;
     },
     dieOn: (method, when) => current.line.dieOn(method, when),
+    spare: () => current.line.spare(),
     get dead() {
       return current.line.dead;
     },
@@ -133,7 +136,8 @@ export async function startHarness(): Promise<Harness> {
     },
     close: async () => {
       await closeStreams();
-      await current.control.close();
+      // A killed process cannot shut down cleanly: its drives wait on Railway forever.
+      if (!current.line.dead) await current.control.close();
       // A killed process's pool has nothing in flight: its drives wait on Railway forever.
       for (const pool of pools) await pool.end();
       const cleanup = new pg.Client({ connectionString: ADMIN_URL });
@@ -169,6 +173,10 @@ class ProcessRailway implements RailwayAdapter {
 
   dieOn(method: FakeMutation, when: DeathPoint): void {
     this.#death = { method, when };
+  }
+
+  spare(): void {
+    this.#death = null;
   }
 
   kill(): void {
