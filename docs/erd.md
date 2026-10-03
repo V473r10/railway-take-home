@@ -221,6 +221,12 @@ container's service straight on Railway as the dashboard would.
 - **Rejected: inject faults into the real GraphQL client.** The adapter boundary
   already exists and is what the tests fake; wrapping it keeps chaos out of the code
   that talks to Railway.
+- **The kill is `process.exit(137)`, not `SIGKILL`.** The first run against real Railway
+  found the signal did nothing: the app is PID 1 of its container, and the kernel drops
+  a `SIGKILL` that PID 1 sends itself, so the process lived on with the interrupted
+  operation hanging. `process.exit` runs no shutdown and drains no pool, so to Railway
+  and to Postgres it is still a crash. Neither the fake nor `scripts/supervise.sh` could
+  show this: locally the app is never PID 1.
 
 ## Cost guards
 

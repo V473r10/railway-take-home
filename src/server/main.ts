@@ -50,10 +50,13 @@ const railway = railwayFromEnv();
 // Chaos mode: a panel in the UI to break the app on purpose (src/server/chaos.ts).
 // Its kill switch relies on the process being restarted after a crash: Railway's
 // ON_FAILURE restart policy does that in production, scripts/supervise.sh locally.
+// The kill is an immediate exit with SIGKILL's status, not a signal: on Railway the
+// app runs as PID 1 of its container, and the kernel drops a SIGKILL that PID 1
+// sends itself, so the process lived on. process.exit runs no pending async work
+// (no shutdown, no pool drain), so to Railway and to the database it is a crash.
+const crash = () => process.exit(137);
 const chaos =
-  process.env.CHAOS === "1"
-    ? new ChaosRailway({ railway, db, crash: () => process.kill(process.pid, "SIGKILL"), log: console.error })
-    : undefined;
+  process.env.CHAOS === "1" ? new ChaosRailway({ railway, db, crash, log: console.error }) : undefined;
 if (chaos) console.warn("CHAOS=1: chaos mode is on; anyone with the password can break this app on purpose");
 const control = new ContainerControl({ db, railway: chaos ?? railway, clock: systemClock });
 chaos?.useTimeline(control.timeline);
