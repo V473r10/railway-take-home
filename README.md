@@ -27,6 +27,9 @@ Railway's dashboard next to the app. The sandbox must be empty.
    the fault in violet, `serviceCreate: no response`, then
    `Looked before repeating serviceCreate: it had acted`: not repeated. Two services in
    the sandbox, not three.
+
+   ![Step 2 against real Railway: the dropped response, the lookup that finds Railway had acted, then running](docs/media/chaos-lost-response.gif)
+
 3. **Kill the process mid-create (60 s).** Click **Kill the process after the next
    write**, then **Create**. The process dies right after Railway accepts the call;
    Railway restarts it. The page can hang for about 30 s while Railway's proxy holds the
